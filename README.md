@@ -7,11 +7,80 @@
 
 ---
 
+## Implementation Status
+
+This repository currently ships a working MCP server prototype. It provides:
+
+- SQLite-backed verbatim block storage
+- `vctx_buffer` with high-watermark drain into archived blocks
+- manual archive/read/search/list/index/decay/delete/status tools
+- keyword search, with optional embedding search when `sentence-transformers` is installed
+- MCP stdio compatibility for Claude Code and other MCP clients
+
+The broader paper-style architecture below describes the intended VCTX direction. Some pieces are still prototype-level: automatic client-side context replacement depends on the host agent calling `vctx_buffer`, index generation is lightweight unless a model-driven indexer is integrated, and semantic search is optional.
+
+Smoke test:
+
+```bash
+python smoke_test.py
+```
+
+---
+
 ## Abstract
 
 Large Language Models (LLMs) are constrained by fixed context windows (e.g., 200k tokens), which limits their effectiveness in long-running conversations and iterative development workflows. Existing approaches—long-context scaling and Retrieval-Augmented Generation (RAG)—each suffer from fundamental trade-offs: the former degrades attention quality (the "Lost in the Middle" problem), while the latter introduces information loss through semantic compression. We propose **VCTX (Virtual Context eXtension)**, a system that borrows the hierarchical memory management paradigm from operating systems to achieve theoretically unbounded context for LLMs without modifying the underlying model. VCTX introduces a **directory-index mechanism**: when the context window approaches capacity, conversation history is moved verbatim into a persistent "Virtual Context" store, and a lightweight semantic index (the "VC Index") replaces it in the active context window. The model navigates this virtual context through tool calls, reading full blocks on demand—akin to a page fault handler in virtual memory systems. We present the system architecture, describe the core mechanisms of context draining, directory generation, and temporal decay-based memory rotation, and discuss the theoretical implications for LLM context management.
 
 **Keywords:** Large Language Models, Context Management, Virtual Memory, Retrieval-Augmented Generation, Long-term Memory
+
+---
+
+## 0. Motivation: Why VCTX, Not Just CLAUDE.md?
+
+Many LLM coding tools (Claude Code, Cursor, etc.) already support a persistent memory file—e.g., `CLAUDE.md`—that is loaded into every conversation's system prompt. This raises a natural question: **why build a separate system?**
+
+The answer is that they solve fundamentally different problems:
+
+```
+CLAUDE.md = A sticky note on your monitor
+VCTX      = The filing cabinet on your desk
+
+The sticky note is always in sight, but you can only write a few lines on it,
+and you have to write them yourself.
+
+The filing cabinet isn't in sight, but you know it's there,
+and you can open it and look up anything at any time.
+```
+
+| Dimension | CLAUDE.md | VCTX |
+|---|---|---|
+| **Who writes it** | User manually | Auto-generated from conversations |
+| **How it's used** | Loaded into every system prompt | Retrieved on-demand via tool calls |
+| **Capacity** | A few KB (too large → attention degrades) | Theoretically unlimited |
+| **Content** | Static instructions, preferences, rules | Dynamic conversation history, decisions, knowledge |
+| **Updates** | Only when the user edits it | Grows automatically with every conversation |
+| **Searchability** | None (model must read it all) | Keyword + semantic vector search |
+| **Expiration** | None (stale content persists) | Temporal decay rotates out stale memories |
+
+**They are complementary, not competing:**
+
+```
+CLAUDE.md tells the model: "Who you are, how to work"
+  → "Reply in Chinese", "Use snake_case", "This project uses ROS2"
+
+VCTX tells the model: "What happened in the past"
+  → "Last Wednesday you helped the user choose PostgreSQL because...",
+     "The user said they dislike glog"
+```
+
+CLAUDE.md manages identity and rules. VCTX manages memory and history. Together they form a complete "LLM operating system":
+
+```
+CLAUDE.md = OS manual (fixed rules)
+VCTX      = OS disk (dynamic memory)
+```
+
+Without VCTX, conversations that extend beyond the context window are simply lost. CLAUDE.md cannot store conversation history—it would fill up in a few turns, and the model would still miss the middle content due to attention degradation.
 
 ---
 
