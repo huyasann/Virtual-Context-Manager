@@ -21,6 +21,34 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 # ══════════════════════════════════════════════════════════
+# Embedding 模型（可选，有则启用语义搜索）
+# ══════════════════════════════════════════════════════════
+
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+
+    _embed_model = SentenceTransformer('BAAI/bge-small-zh-v1.5')
+
+    def embed_text(text: str) -> list[float]:
+        """将文本转换为 embedding 向量"""
+        return _embed_model.encode(text).tolist()
+
+    def cosine_similarity(a: list[float], b: list[float]) -> float:
+        """计算两个向量的余弦相似度"""
+        a_np = np.array(a)
+        b_np = np.array(b)
+        return float(np.dot(a_np, b_np) / (np.linalg.norm(a_np) * np.linalg.norm(b_np)))
+
+    _HAS_EMBEDDING = True
+except ImportError:
+    _HAS_EMBEDDING = False
+    def embed_text(text: str) -> list[float]:
+        return []
+    def cosine_similarity(a: list[float], b: list[float]) -> float:
+        return 0.0
+
+# ══════════════════════════════════════════════════════════
 # Token 计数（真实实现）
 # ══════════════════════════════════════════════════════════
 
@@ -80,6 +108,7 @@ def get_conn() -> sqlite3.Connection:
             is_recalled   INTEGER DEFAULT 0,
             recall_from   TEXT,
             fingerprint   TEXT,
+            embedding     BLOB,
             created_at    TEXT,
             last_access   TEXT,
             importance    REAL DEFAULT 1.0,
@@ -206,16 +235,25 @@ def _process_archive_task(task: dict):
         keywords = _extract_keywords(slice_text)
         conclusion = _extract_conclusion(slice_text)
 
+        # 计算 embedding（如果可用）
+        emb = None
+        if _HAS_EMBEDDING:
+            emb_text = f"{title} {conclusion} {' '.join(keywords)}"
+            emb = embed_text(emb_text)
+            emb = json.dumps(emb)
+        else:
+            emb = None
+
         conn.execute("""
             INSERT OR IGNORE INTO blocks
             (block_id, title, content, token_count, keywords,
              conclusion, session_id, source, is_recalled,
-             recall_from, fingerprint, created_at, last_access)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'drain', 0, NULL, ?, ?, ?)
+             recall_from, fingerprint, embedding, created_at, last_access)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'drain', 0, NULL, ?, ?, ?, ?)
         """, (
             block_id, title, slice_text, slice_tokens,
             json.dumps(keywords, ensure_ascii=False),
-            conclusion, session_id, fp, now, now,
+            conclusion, session_id, fp, emb, now, now,
         ))
         stats["blocks_created"] += 1
         stats["total_tokens"] += slice_tokens
@@ -513,16 +551,22 @@ def vctx_archive(
 
     block_id = f"{datetime.now().strftime('%y%m%d')}-{fp[:6]}"
 
+    # 计算 embedding
+    emb = None
+    if _HAS_EMBEDDING:
+        emb_text = f"{title} {conclusion} {' '.join(keywords)}"
+        emb = json.dumps(embed_text(emb_text))
+
     conn.execute("""
         INSERT INTO blocks
         (block_id, title, content, token_count, keywords,
-         conclusion, session_id, source, fingerprint,
+         conclusion, session_id, source, fingerprint, embedding,
          created_at, last_access, importance)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, 1.0)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 1.0)
     """, (
         block_id, title, content, count_tokens(content),
         json.dumps(keywords, ensure_ascii=False),
-        conclusion, session_id, fp, now, now,
+        conclusion, session_id, fp, emb, now, now,
     ))
     conn.commit()
 
@@ -584,7 +628,7 @@ def vctx_read(block_id: str) -> str:
 @mcp.tool()
 def vctx_search(query: str, top_k: int = 5) -> str:
     """
-    在虚拟上下文中搜索相关信息。
+    在虚拟上下文中搜索相关信息（混合搜索：关键词 + 语义向量）。
 
     什么时候调用：
     - 用户提到某个话题，你不确定在哪个块里
@@ -597,28 +641,54 @@ def vctx_search(query: str, top_k: int = 5) -> str:
     conn = get_conn()
     rows = conn.execute(
         "SELECT block_id, title, conclusion, keywords, "
-        "token_count, importance, access_count "
+        "token_count, importance, access_count, embedding "
         "FROM blocks ORDER BY importance DESC, access_count DESC"
     ).fetchall()
 
     hits = []
     query_words = query.lower().split()
 
+    # 计算 query 的 embedding（如果可用）
+    query_emb = embed_text(query) if _HAS_EMBEDDING else None
+
     for r in rows:
+        score = 0.0
+
+        # ── 关键词匹配分数 ──
         kw = json.loads(r["keywords"]) if r["keywords"] else []
         searchable = f"{r['title']} {r['conclusion']} {' '.join(kw)}".lower()
         matched = [w for w in query_words if w in searchable]
-        if matched:
+        keyword_score = len(matched)
+
+        # ── 语义相似度分数 ──
+        semantic_score = 0.0
+        if query_emb and r["embedding"]:
+            try:
+                block_emb = json.loads(r["embedding"])
+                semantic_score = cosine_similarity(query_emb, block_emb)
+            except:
+                pass
+
+        # ── 混合分数：关键词 * 2 + 语义 * 3 ──
+        # 语义搜索权重更高，因为关键词可能漏掉语义相关的内容
+        if _HAS_EMBEDDING:
+            score = keyword_score * 2.0 + semantic_score * 3.0
+        else:
+            score = keyword_score * 2.0
+
+        if score > 0:
             hits.append({
                 "block_id": r["block_id"],
                 "title": r["title"],
                 "conclusion": r["conclusion"],
                 "token_count": r["token_count"],
-                "match_score": len(matched),
+                "score": round(score, 3),
+                "keyword_score": keyword_score,
+                "semantic_score": round(semantic_score, 3) if _HAS_EMBEDDING else None,
                 "matched_keywords": matched,
             })
 
-    hits.sort(key=lambda x: -x["match_score"])
+    hits.sort(key=lambda x: -x["score"])
 
     if not hits:
         return json.dumps({"message": "未找到相关内容", "results": []})
