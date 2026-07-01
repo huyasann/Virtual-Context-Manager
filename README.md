@@ -486,12 +486,31 @@ The drain operation is the only potentially blocking step. VCTX mitigates this t
 
 4. **Keyword search limitations**: The current implementation uses keyword-based search for `vctx_search`. Semantic search (via embeddings) would improve recall but adds dependency complexity.
 
-### 7.3 Future Work
+### 7.3 Implementation Status
 
+| Feature | Status | Details |
+|---|---|---|
+| Real token counting | ✅ Implemented | tiktoken `cl100k_base`, with char-based fallback |
+| Auto watermark detection | ✅ Implemented | 160k threshold, sliding window retains 20k |
+| Async archival queue | ✅ Implemented | Background thread, max 8 pending tasks |
+| Anti-recursion (fingerprint dedup) | ✅ Implemented | SHA-256 fingerprint, recall metadata filtering |
+| Anti-recursion (recall tagging) | ✅ Implemented | `recall_from` metadata on recalled content |
+| Drain logging & statistics | ✅ Implemented | `drain_log` table with full metrics |
+| Session-based buffer isolation | ✅ Implemented | Per-session_id message buffers |
+| Lightweight keyword extraction | ✅ Implemented | Regex-based, no LLM call needed |
+| VC Index generation via LLM | 🔲 Planned | LLM-powered directory generation |
+| Embedding-based semantic search | 🔲 Planned | Replace keyword matching |
+| HTTP proxy mode | 🔲 Planned | OpenAI-compatible API endpoint |
+| Multi-session / multi-user isolation | 🔲 Planned | Per-user Virtual Context databases |
+| Knowledge graph integration | 🔲 Planned | Entity-level reasoning across blocks |
+| Evaluation experiments | 🔲 Planned | Recall, attention, decay benchmarks |
+
+### 7.4 Future Work
+
+- **LLM-powered VC Index generation**: Replace lightweight keyword extraction with LLM-generated structured directories (title, conclusion, keywords)
 - **Embedding-based semantic search** for the Virtual Context
 - **HTTP proxy mode** for universal API compatibility
 - **Multi-session isolation** with per-user Virtual Contexts
-- **Automatic drain triggering** based on watermark detection
 - **Knowledge graph integration** for entity-level reasoning across blocks
 - **Evaluation experiments** as outlined in Section 6
 
