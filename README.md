@@ -249,6 +249,142 @@ Design choices:
 - **No external dependencies** (no vector database, no graph database)
 - **Single-file portability** (backup = copy one file)
 
+### 4.4 Implementation Rationale and Design Decisions
+
+#### 4.4.1 Why MCP Instead of a Standalone Proxy?
+
+We considered three deployment models:
+
+| Model | Description | Pros | Cons |
+|---|---|---|---|
+| **HTTP Proxy** | Intercept API calls between client and LLM | Transparent to user | Complex: need to parse/modify streaming responses, handle SSE, manage auth passthrough |
+| **Python Library** | `from vctx import VCtx; ctx.chat(...)` | Simple API | Only usable in code, no integration with existing tools |
+| **MCP Server** | Register tools that any MCP client can call | Native integration with Claude Code, VS Code, etc. | Requires MCP-compatible client |
+
+We chose MCP because:
+1. It maps naturally to the virtual memory metaphor (tool calls = page faults)
+2. It requires zero modification to the LLM host application
+3. The LLM itself decides when to read from Virtual Context—we don't need to build heuristic triggers
+4. MCP is an emerging Anthropic-backed standard with growing ecosystem support
+
+The alternative (HTTP proxy) would require implementing a full OpenAI-compatible API server, handling streaming SSE responses, managing request queuing, and injecting system prompts—all of which add substantial complexity. MCP delegates the "when to read" decision to the model itself, which is both simpler and more flexible.
+
+#### 4.4.2 Why Verbatim Storage Instead of Compression?
+
+The critical design decision in VCTX is to store original conversation text verbatim rather than LLM-generated summaries. This seems counterintuitive—why waste disk space on raw text when a summary is more compact?
+
+The reasoning is:
+
+1. **Summary quality is unpredictable.** An LLM summarizing a 170k-token conversation may miss nuances, misattribute decisions, or lose technical specificity. These errors are invisible and cumulative.
+
+2. **Summaries are irreversible.** Once you summarize, the original details are gone. If the summary was wrong, there's no way to recover.
+
+3. **The VC Index serves as the "compression."** The directory itself is a form of structured summarization—each block gets a title, conclusion, and keywords. But crucially, the original text remains available for full retrieval.
+
+4. **Disk is cheap.** A 170k-token conversation (~340KB of text) is negligible by modern storage standards. Storing 1000 such conversations uses ~340MB—less than a single Docker image.
+
+This design follows the principle: **compress the index, not the data.**
+
+#### 4.4.3 Why Keyword Search Instead of Embedding Search?
+
+The current `vctx_search` implementation uses keyword matching, which is deliberately simple. This is a pragmatic first-step decision:
+
+- **Keyword search has zero dependency**: no embedding model, no vector database, no GPU
+- **For structured topic blocks with explicit keywords**, keyword search performs surprisingly well—the VC Index already contains curated keywords per block
+- **Embedding search is a planned upgrade**, not a replacement. The block structure (title + conclusion + keywords) provides rich metadata that embedding search can layer on top of
+
+The architecture is designed so that swapping keyword search for embedding search requires only changing the `vctx_search` function—the rest of the system (storage, indexing, decay) remains unchanged.
+
+#### 4.4.4 Why SQLite Instead of a Vector Database?
+
+| Requirement | SQLite | Chroma / FAISS / Pinecone |
+|---|---|---|
+| Installation | `pip install` (stdlib) | Additional dependency |
+| Deployment | Single `.db` file | Server process or data directory |
+| Text storage | Native | Requires separate metadata store |
+| Vector search | Via `sqlite-vec` extension | Native |
+| Backup | Copy one file | Export/import tooling |
+| Concurrent access | WAL mode | Varies |
+
+For a system whose primary operation is **storing and retrieving text blocks by ID and metadata**, SQLite is the natural choice. Vector search is an optimization layer that can be added via `sqlite-vec` without changing the storage architecture.
+
+#### 4.4.5 Context Drain: The "Page Replacement" Flow
+
+When the context window hits the high watermark (170k tokens), the drain operation executes as follows:
+
+```
+                    User's Context (170k tokens)
+                    ┌──────────────────────────┐
+                    │ Turn 1                   │
+                    │ Turn 2                   │
+                    │ ...                      │
+                    │ Turn 80  ← cut point     │
+                    │ Turn 81                  │
+                    │ ...                      │
+                    │ Turn 100 (most recent)   │
+                    └──────────────────────────┘
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+            Evicted (→ LLM Indexer)   Retained (stays in context)
+            ┌──────────────┐         ┌──────────────┐
+            │ Turn 1~80    │         │ Turn 81~100  │
+            │ (150k tokens)│         │ (20k tokens) │
+            └──────┬───────┘         └──────────────┘
+                   │
+                   ▼
+            ┌──────────────┐
+            │ LLM generates│
+            │ VC Index     │
+            │ (3~8k tokens)│
+            └──────┬───────┘
+                   │
+            ┌──────┴───────┐
+            ▼              ▼
+     VC Index replaces   Original text
+     old context in      stored verbatim
+     system prompt       in SQLite
+```
+
+Key properties of this flow:
+- **O(n) deep copy** of the context snapshot (memory-only, no I/O blocking)
+- **Async archival**: the LLM indexer runs in a background thread; the user's conversation continues immediately
+- **Atomic**: the SQLite write is wrapped in a transaction; a crash mid-archive leaves the database consistent
+- **Idempotent**: re-running the same archive produces the same block IDs (SHA-256 fingerprint prevents duplicates)
+
+#### 4.4.6 The Anti-Recursion Data Flow
+
+The most subtle engineering challenge is preventing recalled content from being re-archived. Here is the exact data flow:
+
+```
+Step 1: User asks about a past topic
+        → Model calls vctx_read("003")
+        → VCTX returns full block content
+
+Step 2: VCTX injects content with recall metadata
+        message = {
+            "role": "system",
+            "content": "[Recalled Memory]: ...",
+            "metadata": {
+                "recall_from": "003",
+                "recalled_at": "2026-07-01T12:00:00"
+            }
+        }
+        → This message enters the primary context
+
+Step 3: Conversation continues... eventually triggers drain
+
+Step 4: Drain scans all messages
+        for msg in evicted_messages:
+            if msg.metadata.recall_from:
+                db.update_access_count(msg.metadata.recall_from)  ← only update
+                SKIP archival                                     ← do not re-store
+            else:
+                archive normally
+```
+
+This ensures that recalled content is "invisible" to the archival pipeline—it exists only in the primary context during active use and leaves no storage footprint on re-drain.
+
 ---
 
 ## 5. Theoretical Analysis
