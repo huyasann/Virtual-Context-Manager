@@ -121,6 +121,10 @@ def db_conn():
                 ON blocks(fingerprint);
             CREATE INDEX IF NOT EXISTS idx_blocks_session
                 ON blocks(session_id);
+            CREATE INDEX IF NOT EXISTS idx_blocks_project
+                ON blocks(project_id);
+            CREATE INDEX IF NOT EXISTS idx_blocks_user
+                ON blocks(user_id);
             CREATE INDEX IF NOT EXISTS idx_blocks_recall
                 ON blocks(recall_from);
             """
@@ -140,6 +144,8 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     }
     columns = {
         "session_id": "TEXT",
+        "project_id": "TEXT",
+        "user_id": "TEXT",
         "source": "TEXT DEFAULT 'manual'",
         "is_recalled": "INTEGER DEFAULT 0",
         "recall_from": "TEXT",
@@ -379,9 +385,10 @@ def _process_archive_task(task: dict[str, Any]) -> None:
                 """
                 INSERT INTO blocks
                 (block_id, title, content, token_count, keywords,
-                 conclusion, session_id, source, is_recalled,
-                 recall_from, fingerprint, embedding, created_at, last_access)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'drain', 0, NULL, ?, ?, ?, ?)
+                 conclusion, session_id, project_id, user_id,
+                 source, is_recalled, recall_from, fingerprint, embedding,
+                 created_at, last_access)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'drain', 0, NULL, ?, ?, ?, ?)
                 """,
                 (
                     block_id,
@@ -391,6 +398,8 @@ def _process_archive_task(task: dict[str, Any]) -> None:
                     json.dumps(keywords, ensure_ascii=False),
                     conclusion,
                     session_id,
+                    task.get("project_id", ""),
+                    task.get("user_id", ""),
                     fingerprint,
                     embedding,
                     now,
@@ -404,7 +413,7 @@ def _process_archive_task(task: dict[str, Any]) -> None:
         _log_drain(conn, stats)
 
 
-def _do_drain(session_id: str) -> str:
+def _do_drain(session_id: str, project_id: str = "", user_id: str = "") -> str:
     drain_id = str(uuid.uuid4())[:12]
     messages = _session_buffers.get(session_id, [])
     if not messages:
@@ -431,6 +440,8 @@ def _do_drain(session_id: str) -> str:
         "drain_id": drain_id,
         "messages": evicted,
         "session_id": session_id,
+        "project_id": project_id,
+        "user_id": user_id,
         "started_at": datetime.now().isoformat(),
     }
     try:
@@ -456,6 +467,8 @@ def vctx_buffer(
     role: str,
     content: str,
     metadata: dict[str, Any] | None = None,
+    project_id: str = "",
+    user_id: str = "",
 ) -> str:
     """Append a message to a session buffer and trigger drain at the high watermark."""
     _ensure_worker()
@@ -471,7 +484,7 @@ def vctx_buffer(
         buffer_tokens = count_messages_tokens(buffer)
 
         if buffer_tokens >= DRAIN_THRESHOLD:
-            drain_id = _do_drain(session_id)
+            drain_id = _do_drain(session_id, project_id, user_id)
             return json_dumps(
                 {
                     "status": "drain_triggered",
@@ -503,6 +516,8 @@ def vctx_archive(
     conclusion: str,
     keywords: list[str],
     session_id: str = "default",
+    project_id: str = "",
+    user_id: str = "",
 ) -> str:
     """Manually archive an important conversation or knowledge block."""
     block_id, fingerprint = make_block_id(content)
@@ -525,9 +540,10 @@ def vctx_archive(
             """
             INSERT INTO blocks
             (block_id, title, content, token_count, keywords,
-             conclusion, session_id, source, fingerprint, embedding,
+             conclusion, session_id, project_id, user_id,
+             source, fingerprint, embedding,
              created_at, last_access, importance)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 1.0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 1.0)
             """,
             (
                 block_id,
@@ -537,6 +553,8 @@ def vctx_archive(
                 json.dumps(normalized_keywords, ensure_ascii=False),
                 conclusion,
                 session_id,
+                project_id,
+                user_id,
                 fingerprint,
                 embedding,
                 now,
@@ -582,20 +600,33 @@ def vctx_read(block_id: str) -> str:
 
 
 @mcp.tool()
-def vctx_search(query: str, top_k: int = 5) -> str:
+def vctx_search(query: str, top_k: int = 5, project_id: str = "", user_id: str = "") -> str:
     """Search archived blocks with keyword scoring and optional embedding similarity."""
     top_k = max(1, min(int(top_k), 20))
     query_terms = tokenize_query(query)
     query_embedding = embed_text(query) if _HAS_EMBEDDING else None
 
     with db_conn() as conn:
+        # Build dynamic WHERE clause for optional project/user filtering
+        filters: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            filters.append("project_id = ?")
+            params.append(project_id)
+        if user_id:
+            filters.append("user_id = ?")
+            params.append(user_id)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
+
         rows = conn.execute(
-            """
+            f"""
             SELECT block_id, title, conclusion, keywords, token_count,
                    importance, access_count, embedding
             FROM blocks
+            {where}
             ORDER BY importance DESC, access_count DESC, created_at DESC
-            """
+            """,
+            params,
         ).fetchall()
 
     hits: list[dict[str, Any]] = []
@@ -643,16 +674,28 @@ def vctx_search(query: str, top_k: int = 5) -> str:
 
 
 @mcp.tool()
-def vctx_list() -> str:
+def vctx_list(project_id: str = "", user_id: str = "") -> str:
     """List archived virtual-context blocks."""
     with db_conn() as conn:
+        filters: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            filters.append("project_id = ?")
+            params.append(project_id)
+        if user_id:
+            filters.append("user_id = ?")
+            params.append(user_id)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
+
         rows = conn.execute(
-            """
+            f"""
             SELECT block_id, title, conclusion, keywords, token_count,
                    importance, access_count, created_at, last_access
             FROM blocks
+            {where}
             ORDER BY importance DESC, created_at DESC
-            """
+            """,
+            params,
         ).fetchall()
 
     blocks: list[dict[str, Any]] = []
@@ -781,7 +824,7 @@ def vctx_delete(block_id: str) -> str:
 
 
 @mcp.tool()
-def vctx_status(session_id: str = "default") -> str:
+def vctx_status(session_id: str = "default", project_id: str = "", user_id: str = "") -> str:
     """Return buffer, archive, drain, worker, and storage diagnostics."""
     with _session_buffer_lock:
         buffer = _session_buffers.get(session_id, [])
@@ -789,8 +832,21 @@ def vctx_status(session_id: str = "default") -> str:
         buffer_tokens = count_messages_tokens(buffer)
 
     with db_conn() as conn:
-        block_count = conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
-        total_tokens = conn.execute("SELECT COALESCE(SUM(token_count), 0) FROM blocks").fetchone()[0]
+        # Build optional filter for block count and total tokens
+        filters: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            filters.append("project_id = ?")
+            params.append(project_id)
+        if user_id:
+            filters.append("user_id = ?")
+            params.append(user_id)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
+
+        block_count = conn.execute(f"SELECT COUNT(*) FROM blocks {where}", params).fetchone()[0]
+        total_tokens = conn.execute(
+            f"SELECT COALESCE(SUM(token_count), 0) FROM blocks {where}", params
+        ).fetchone()[0]
         last_drain = conn.execute(
             "SELECT * FROM drain_log ORDER BY started_at DESC LIMIT 1"
         ).fetchone()
