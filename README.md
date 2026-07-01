@@ -499,7 +499,7 @@ The drain operation is the only potentially blocking step. VCTX mitigates this t
 | Session-based buffer isolation | ✅ Implemented | Per-session_id message buffers |
 | Lightweight keyword extraction | ✅ Implemented | Regex-based, no LLM call needed |
 | VC Index generation via LLM | ✅ Implemented | `vctx_index` tool: model refines block metadata after reading |
-| Embedding-based semantic search | 🔲 Planned | Replace keyword matching |
+| Embedding-based semantic search | ✅ Implemented | Hybrid search: keyword * 2 + cosine similarity * 3, optional bge-small-zh |
 | HTTP proxy mode | 🔲 Planned | OpenAI-compatible API endpoint |
 | Multi-session / multi-user isolation | 🔲 Planned | Per-user Virtual Context databases |
 | Knowledge graph integration | 🔲 Planned | Entity-level reasoning across blocks |
