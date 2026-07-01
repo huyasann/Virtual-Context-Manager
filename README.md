@@ -569,8 +569,8 @@ The drain operation is the only potentially blocking step. VCTX mitigates this t
 | Lightweight keyword extraction | ✅ Implemented | Regex-based, no LLM call needed |
 | VC Index generation via LLM | ✅ Implemented | `vctx_index` tool: model refines block metadata after reading |
 | Embedding-based semantic search | ✅ Implemented | Hybrid search: keyword * 2 + cosine similarity * 3, optional bge-small-zh |
+| Multi-session / multi-user isolation | ✅ Implemented | Optional `project_id` / `user_id` filtering on all tools |
 | HTTP proxy mode | 🔲 Planned | OpenAI-compatible API endpoint |
-| Multi-session / multi-user isolation | 🔲 Planned | Per-user Virtual Context databases |
 | Knowledge graph integration | 🔲 Planned | Entity-level reasoning across blocks |
 | Evaluation experiments | 🔲 Planned | Recall, attention, decay benchmarks |
 
@@ -579,7 +579,6 @@ The drain operation is the only potentially blocking step. VCTX mitigates this t
 - **LLM-powered VC Index generation**: Replace lightweight keyword extraction with LLM-generated structured directories (title, conclusion, keywords)
 - **Embedding-based semantic search** for the Virtual Context
 - **HTTP proxy mode** for universal API compatibility
-- **Multi-session isolation** with per-user Virtual Contexts
 - **Knowledge graph integration** for entity-level reasoning across blocks
 - **Evaluation experiments** as outlined in Section 6
 
