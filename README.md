@@ -1,6 +1,6 @@
 # Virtual Context Manager (vctx)
 
-**基于虚拟内存管理思想的 LLM 无限上下文系统**
+**基于虚拟内存管理的 LLM 扩宽上下文系统**
 
 [![MCP](https://img.shields.io/badge/MCP-Compatible-blue)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
