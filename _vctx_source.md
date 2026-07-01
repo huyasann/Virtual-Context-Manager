@@ -1,95 +1,143 @@
-# VCTX — Virtual Context Manager
+# VCTX - Compact Recovery Rules
 
-> 把本文件内容追加到你的 `CLAUDE.md` 中，或直接放到项目根目录让模型读取。
+> Put this content in `CLAUDE.md` when VCTX should act as a low-cost recovery memory, not a per-turn logger.
 
-## 你有 VCTX
+## Core Strategy
 
-你的项目接入了 VCTX（虚拟上下文管理器），提供 `vctx_archive`、`vctx_search`、`vctx_read`、`vctx_list` 工具，用于长期记忆存储。
+Use VCTX only at recovery/checkpoint moments.
 
-## 规则（共 3 条）
+Default:
 
-### 规则 1：Compact 后必归档
+- Do not call `vctx_buffer` every turn.
+- Do not archive routine short exchanges.
+- Do not archive raw compact summaries without enriching them first.
 
-当你在上下文中看到类似以下的系统消息时：
+Main flow:
 
-> "The conversation so far has been compacted" / "context has been compacted" / "summary above"
-
-**立即执行：**
-
-1. 读取 compact summary 中提到的所有关键文件（用 Read/Grep 工具）
-2. 按主题拆分，每个主题调用一次 `vctx_archive`
-3. 调用 `vctx_list` 确认归档完成
-4. 告知用户："上下文已压缩，关键内容已归档到 VCTX，可随时检索。"
-
-### 规则 2：重大任务完成后 checkpoint
-
-完成一个重要任务（功能实现、bug 修复、架构决策）后，调用一次 `vctx_archive` 保存结果。
-
-判断标准：如果这个任务花了超过 3 轮对话，就值得归档。
-
-### 规则 3：用户提到历史内容时检索
-
-当用户说"之前那个..."、"上次做的..."、"之前改过..."时：
-
-1. `vctx_search(query="<关键词>")` 搜索
-2. `vctx_read(block_id="<id>")` 读取完整内容
-3. 基于检索内容回答
-
-新会话开始时，`vctx_list` 查看已归档目录（不要主动输出给用户）。
-
-## 归档格式
-
+```text
+normal work
+-> compact happens or a substantial task completes
+-> extract anchors
+-> read source files when available
+-> archive enriched checkpoint
+-> recover later with vctx_list / vctx_search / vctx_read
 ```
+
+## Rule 1: After Compact, Archive Once
+
+If the conversation has just been compacted, resumed from a summary, or earlier raw context has been replaced by a compact summary, immediately create one VCTX checkpoint.
+
+Do not store the compact summary as-is.
+
+Before archiving:
+
+1. Extract anchors from the compact summary:
+   - project name
+   - file paths
+   - commands
+   - error messages
+   - APIs/tools
+   - decisions
+   - unfinished next steps
+2. Read source files mentioned by the summary when they are available.
+3. Use the file contents plus the compact summary to create an enriched checkpoint.
+
+If the summary mentions decisions that are not recoverable from files, store them explicitly and label them as summary-derived.
+
+## Rule 2: Checkpoint Completed Substantial Tasks
+
+When a task took more than a few turns or produced durable state, archive one checkpoint at task completion.
+
+Durable state includes:
+
+- code changes
+- config changes
+- environment setup
+- debugging root cause
+- architecture decisions
+- important paths, commands, or test results
+
+Do not checkpoint pure chat, simple confirmations, or tasks with no useful future recovery value.
+
+## Rule 3: Recall Only When Needed
+
+Use VCTX retrieval only when:
+
+- the user asks to continue previous work
+- the user refers to earlier context
+- compact happened and you need missing details
+- the current task depends on archived decisions or prior fixes
+
+Recall flow:
+
+```text
+vctx_list
+vctx_search(query="<specific topic>")
+vctx_read(block_id="<relevant id>")
+```
+
+Read only the most relevant 1-3 blocks. Do not dump the full archive unless the user asks.
+
+## Archive Template
+
+Use `vctx_archive`:
+
+```text
 vctx_archive(
-  title = "做什么 — 一句话结果",
-  content = """
-## 背景
-为什么做这件事
-
-## 做了什么
-具体改动：文件路径、函数名、代码片段
-
-## 关键决策
-为什么选择这个方案而不是其他
-
-## 结果
-最终状态、测试结果、遗留问题
-
-## 相关文件
-- path/to/file1.py
-- path/to/file2.md
-""",
-  conclusion = "一句话总结：做了X，结果是Y",
-  keywords = ["关键词1", "关键词2", "关键词3"],
-  project_id = "<项目名>"
+  title = "specific checkpoint title",
+  content = "enriched recovery details: compact-summary anchors, source-file facts, exact paths, commands, errors, code/config changes, decisions, verification, and next steps",
+  conclusion = "one-sentence current state or outcome",
+  keywords = ["project", "feature", "file", "tool", "error"],
+  session_id = "main"
 )
 ```
 
-## 归档示例（好 vs 差）
+Do not pass unsupported arguments such as `project_id`.
 
-**好的归档：**
-- title: "给 VCTX 所有工具添加 project_id 过滤"
-- content: 包含改动的文件、函数签名变化、INSERT 语句变化、测试结果
-- conclusion: "9 个工具全部支持 project_id/user_id 可选参数，smoke test 通过"
-- keywords: ["vctx", "project_id", "multi-session", "filter"]
+## Archive Quality Bar
 
-**差的归档：**
-- title: "代码修改"
-- content: "帮用户改了一些代码"
-- conclusion: "改完了"
-- keywords: ["code", "change"]
+A useful checkpoint must answer:
 
-## 不要归档
+- What was being done?
+- What changed?
+- Which files/commands/errors matter?
+- What decisions were made?
+- What is verified?
+- What remains next?
 
-- 纯闲聊、打招呼、确认（"好的"、"没问题"）
-- 已在 VCTX 中存在的内容（先搜索确认）
-- 没有技术细节的纯讨论
-- compact summary 本身（必须先读取源文件丰富内容后再归档）
+Good checkpoint:
 
-## 关于 CLAUDE.md 与 VCTX
+- `title`: "Fix Claude Desktop VCTX MCP config"
+- `content`: includes actual config path, exact JSON key, server path, verification command, and result
+- `conclusion`: "Claude Desktop 3p reads MCP config from Local Claude-3p, not Roaming Claude."
+- `keywords`: `["Claude Desktop", "VCTX", "MCP", "claude_desktop_config", "Claude-3p"]`
 
-| | CLAUDE.md | VCTX |
+Bad checkpoint:
+
+- stores only "we fixed the MCP issue"
+- stores only raw compact summary
+- omits file paths or commands
+- uses generic keywords like `code`, `fix`, `task`
+
+## Do Not Archive
+
+Do not archive:
+
+- pure small talk
+- simple acknowledgements
+- duplicate content already in VCTX
+- raw compact summaries without enrichment
+- speculative discussion with no decision
+- tasks with no code/config/decision/debugging output
+- secrets, unless the user explicitly asks to store them
+
+## Relationship Between CLAUDE.md And VCTX
+
+| Item | CLAUDE.md | VCTX |
 |---|---|---|
-| 内容 | 静态规则和偏好 | 动态对话记忆 |
-| 谁写 | 用户手动编辑 | 模型自动归档 |
-| 何时生效 | 每次会话加载 | 按需检索 |
+| Purpose | Static rules and preferences | Dynamic recovery memory |
+| Written by | User or project maintainer | Model checkpoints important state |
+| Loaded when | Every session | Retrieved on demand |
+| Analogy | Operating manual | Project notebook |
+
+CLAUDE.md says how to work. VCTX stores what happened.

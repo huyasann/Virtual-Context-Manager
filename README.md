@@ -25,6 +25,51 @@ Smoke test:
 python smoke_test.py
 ```
 
+### VCTX Proxy MVP
+
+This repository also includes `proxy.py`, an experimental memory middleware for
+OpenAI-compatible and Anthropic-compatible clients.
+
+Supported endpoints:
+
+- `POST /v1/chat/completions` for OpenAI-compatible clients
+- `POST /v1/messages` for Anthropic-compatible clients
+- `GET /healthz` for local health checks
+
+The proxy:
+
+1. extracts the latest user message
+2. recalls relevant blocks from `~/.vctx/memory.db`
+3. injects a bounded `<VCTX_MEMORY>` section into the request
+4. forwards the request to `VCTX_UPSTREAM_BASE_URL`
+5. archives substantial non-streaming turns as proxy checkpoints
+
+Run:
+
+```bash
+set VCTX_UPSTREAM_BASE_URL=http://127.0.0.1:3456
+set VCTX_UPSTREAM_API_KEY=your-upstream-key
+python proxy.py --host 127.0.0.1 --port 8787
+```
+
+Then point an OpenAI-compatible client at:
+
+```text
+http://127.0.0.1:8787/v1
+```
+
+For Anthropic-compatible clients, point `/v1/messages` traffic to:
+
+```text
+http://127.0.0.1:8787/v1/messages
+```
+
+Proxy smoke test:
+
+```bash
+python proxy_smoke_test.py
+```
+
 ---
 
 ## Abstract
