@@ -685,8 +685,50 @@ def vctx_list() -> str:
 
 
 # ────────────────────────────────────────────────────────
-# 衰减 / 删除 / 状态
+# 衰减 / 删除 / 状态 / LLM Index
 # ────────────────────────────────────────────────────────
+
+@mcp.tool()
+def vctx_index(block_id: str, title: str, conclusion: str, keywords: list[str]) -> str:
+    """
+    用 LLM 为一个已归档的块生成高质量目录索引。
+
+    当你读取了一个 vctx 块后，觉得它的自动提取的 title/conclusion/keywords 不够好时，
+    调用此工具用你自己的理解来更新目录信息。
+
+    这是 VC Index 的核心：模型自己决定怎么描述每个历史块。
+
+    参数：
+        block_id: 要更新的块 ID
+        title: 你总结的主题名（10字以内）
+        conclusion: 你总结的关键结论（30字以内）
+        keywords: 你提取的检索关键词（3-5个）
+    """
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT block_id FROM blocks WHERE block_id = ?", (block_id,)
+    ).fetchone()
+
+    if not row:
+        return json.dumps({"error": f"未找到块 {block_id}"})
+
+    conn.execute("""
+        UPDATE blocks SET title=?, conclusion=?, keywords=?
+        WHERE block_id=?
+    """, (
+        title, conclusion,
+        json.dumps(keywords, ensure_ascii=False),
+        block_id,
+    ))
+    conn.commit()
+
+    return json.dumps({
+        "status": "indexed",
+        "block_id": block_id,
+        "title": title,
+        "conclusion": conclusion,
+        "keywords": keywords,
+    }, ensure_ascii=False)
 
 @mcp.tool()
 def vctx_decay(days_threshold: int = 30) -> str:
