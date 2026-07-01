@@ -498,7 +498,7 @@ The drain operation is the only potentially blocking step. VCTX mitigates this t
 | Drain logging & statistics | ✅ Implemented | `drain_log` table with full metrics |
 | Session-based buffer isolation | ✅ Implemented | Per-session_id message buffers |
 | Lightweight keyword extraction | ✅ Implemented | Regex-based, no LLM call needed |
-| VC Index generation via LLM | 🔲 Planned | LLM-powered directory generation |
+| VC Index generation via LLM | ✅ Implemented | `vctx_index` tool: model refines block metadata after reading |
 | Embedding-based semantic search | 🔲 Planned | Replace keyword matching |
 | HTTP proxy mode | 🔲 Planned | OpenAI-compatible API endpoint |
 | Multi-session / multi-user isolation | 🔲 Planned | Per-user Virtual Context databases |
