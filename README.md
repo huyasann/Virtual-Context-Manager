@@ -70,6 +70,25 @@ Proxy smoke test:
 python proxy_smoke_test.py
 ```
 
+### CC Switch Integration Prototype
+
+The portable CC Switch middleware experiment lives in:
+
+```text
+integrations/ccswitch/
+```
+
+It contains a VCTX-only Rust module, an integration patch for CC Switch's proxy
+hot path, and an adversarial review of the risks. The idea is to let CC Switch
+continue handling provider routing while VCTX handles memory recall/injection
+and response checkpointing.
+
+Validation:
+
+```bash
+python integrations/ccswitch/validate_ccswitch_integration.py
+```
+
 ---
 
 ## Abstract

@@ -1,0 +1,658 @@
+diff --git a/src-tauri/src/database/dao/settings.rs b/src-tauri/src/database/dao/settings.rs
+index 85524e8..57a2b1f 100644
+--- a/src-tauri/src/database/dao/settings.rs
++++ b/src-tauri/src/database/dao/settings.rs
+@@ -310,6 +310,27 @@ impl Database {
+     // --- 日志配置 ---
+ 
+     /// 获取日志配置
++    pub fn get_vctx_memory_config(
++        &self,
++    ) -> Result<crate::proxy::types::VctxMemoryConfig, AppError> {
++        match self.get_setting("vctx_memory_config")? {
++            Some(json) => serde_json::from_str(&json).map_err(|e| {
++                AppError::Database(format!("Failed to parse VCTX memory config: {e}"))
++            }),
++            None => Ok(crate::proxy::types::VctxMemoryConfig::default()),
++        }
++    }
++
++    pub fn set_vctx_memory_config(
++        &self,
++        config: &crate::proxy::types::VctxMemoryConfig,
++    ) -> Result<(), AppError> {
++        let json = serde_json::to_string(config).map_err(|e| {
++            AppError::Database(format!("Failed to serialize VCTX memory config: {e}"))
++        })?;
++        self.set_setting("vctx_memory_config", &json)
++    }
++
+     pub fn get_log_config(&self) -> Result<crate::proxy::types::LogConfig, AppError> {
+         match self.get_setting("log_config")? {
+             Some(json) => serde_json::from_str(&json)
+diff --git a/src-tauri/src/proxy/forwarder.rs b/src-tauri/src/proxy/forwarder.rs
+index d11e529..e207e58 100644
+--- a/src-tauri/src/proxy/forwarder.rs
++++ b/src-tauri/src/proxy/forwarder.rs
+@@ -19,7 +19,9 @@ use super::{
+     thinking_rectifier::{
+         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
+     },
+-    types::{CopilotOptimizerConfig, OptimizerConfig, ProxyStatus, RectifierConfig},
++    types::{
++        CopilotOptimizerConfig, OptimizerConfig, ProxyStatus, RectifierConfig, VctxMemoryConfig,
++    },
+     ProxyError,
+ };
+ use crate::commands::{CodexOAuthState, CopilotAuthState};
+@@ -118,6 +120,7 @@ pub struct RequestForwarder {
+     optimizer_config: OptimizerConfig,
+     /// Copilot 优化器配置
+     copilot_optimizer_config: CopilotOptimizerConfig,
++    vctx_memory_config: VctxMemoryConfig,
+     /// 非流式请求超时（秒）
+     non_streaming_timeout: std::time::Duration,
+     /// 流式请求响应头等待超时（秒）
+@@ -194,6 +197,7 @@ impl RequestForwarder {
+         rectifier_config: RectifierConfig,
+         optimizer_config: OptimizerConfig,
+         copilot_optimizer_config: CopilotOptimizerConfig,
++        vctx_memory_config: VctxMemoryConfig,
+         max_retries: u32,
+     ) -> Self {
+         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
+@@ -213,6 +217,7 @@ impl RequestForwarder {
+             rectifier_config,
+             optimizer_config,
+             copilot_optimizer_config,
++            vctx_memory_config,
+             non_streaming_timeout: std::time::Duration::from_secs(non_streaming_timeout),
+             streaming_first_byte_timeout: std::time::Duration::from_secs(
+                 streaming_first_byte_timeout,
+@@ -445,6 +450,13 @@ impl RequestForwarder {
+                     body.clone()
+                 };
+ 
++            super::vctx_memory::apply_request_memory(
++                &mut provider_body,
++                &self.vctx_memory_config,
++                &self.session_id,
++                app_type_str,
++            );
++
+             attempted_providers += 1;
+ 
+             // 更新状态中的当前 Provider 信息（per-attempt 维度的标识）
+@@ -2841,6 +2853,7 @@ mod tests {
+             rectifier_config: RectifierConfig::default(),
+             optimizer_config: OptimizerConfig::default(),
+             copilot_optimizer_config: CopilotOptimizerConfig::default(),
++            vctx_memory_config: VctxMemoryConfig::default(),
+             non_streaming_timeout,
+             streaming_first_byte_timeout,
+             max_attempts: 1,
+diff --git a/src-tauri/src/proxy/handler_context.rs b/src-tauri/src/proxy/handler_context.rs
+index 29be37d..819ceb9 100644
+--- a/src-tauri/src/proxy/handler_context.rs
++++ b/src-tauri/src/proxy/handler_context.rs
+@@ -70,6 +70,8 @@ pub struct RequestContext {
+     pub optimizer_config: OptimizerConfig,
+     /// Copilot 优化器配置
+     pub copilot_optimizer_config: CopilotOptimizerConfig,
++    /// VCTX memory injection/checkpoint config.
++    pub vctx_memory_config: crate::proxy::types::VctxMemoryConfig,
+ }
+ 
+ impl RequestContext {
+@@ -106,6 +108,7 @@ impl RequestContext {
+         let rectifier_config = state.db.get_rectifier_config().unwrap_or_default();
+         let optimizer_config = state.db.get_optimizer_config().unwrap_or_default();
+         let copilot_optimizer_config = state.db.get_copilot_optimizer_config().unwrap_or_default();
++        let vctx_memory_config = state.db.get_vctx_memory_config().unwrap_or_default();
+ 
+         let current_provider_id =
+             crate::settings::get_current_provider(&app_type).unwrap_or_default();
+@@ -173,6 +176,7 @@ impl RequestContext {
+             rectifier_config,
+             optimizer_config,
+             copilot_optimizer_config,
++            vctx_memory_config,
+         })
+     }
+ 
+@@ -240,6 +244,7 @@ impl RequestContext {
+             self.rectifier_config.clone(),
+             self.optimizer_config.clone(),
+             self.copilot_optimizer_config.clone(),
++            self.vctx_memory_config.clone(),
+             max_retries,
+         )
+     }
+diff --git a/src-tauri/src/proxy/mod.rs b/src-tauri/src/proxy/mod.rs
+index cbc2440..65f4d6d 100644
+--- a/src-tauri/src/proxy/mod.rs
++++ b/src-tauri/src/proxy/mod.rs
+@@ -35,6 +35,7 @@ pub mod thinking_optimizer;
+ pub mod thinking_rectifier;
+ pub(crate) mod types;
+ pub mod usage;
++pub(crate) mod vctx_memory;
+ 
+ // 公开导出给外部使用（commands, services等模块需要）
+ #[allow(unused_imports)]
+diff --git a/src-tauri/src/proxy/response_processor.rs b/src-tauri/src/proxy/response_processor.rs
+index 238e144..014269f 100644
+--- a/src-tauri/src/proxy/response_processor.rs
++++ b/src-tauri/src/proxy/response_processor.rs
+@@ -308,6 +308,16 @@ pub async fn handle_non_streaming(
+         builder = builder.header(key, value);
+     }
+ 
++    if status.is_success() {
++        super::vctx_memory::maybe_checkpoint_response(
++            &body_bytes,
++            &ctx.vctx_memory_config,
++            &ctx.session_id,
++            ctx.app_type_str,
++            ctx.outbound_model.as_deref().unwrap_or(&ctx.request_model),
++        );
++    }
++
+     let body = axum::body::Body::from(body_bytes);
+     builder.body(body).map_err(|e| {
+         log::error!("[{}] 构建响应失败: {e}", ctx.tag);
+diff --git a/src-tauri/src/proxy/types.rs b/src-tauri/src/proxy/types.rs
+index f2dfc58..a35f5e4 100644
+--- a/src-tauri/src/proxy/types.rs
++++ b/src-tauri/src/proxy/types.rs
+@@ -344,6 +344,57 @@ impl Default for CopilotOptimizerConfig {
+     }
+ }
+ 
++/// VCTX memory proxy config.
++///
++/// Stored in settings as key = "vctx_memory_config".
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct VctxMemoryConfig {
++    #[serde(default = "default_true")]
++    pub enabled: bool,
++    #[serde(default = "default_vctx_db_path")]
++    pub db_path: String,
++    #[serde(default = "default_vctx_top_k")]
++    pub recall_top_k: usize,
++    #[serde(default = "default_vctx_max_memory_chars")]
++    pub max_memory_chars: usize,
++    #[serde(default = "default_vctx_checkpoint_min_chars")]
++    pub checkpoint_min_chars: usize,
++}
++
++fn default_vctx_db_path() -> String {
++    dirs::home_dir()
++        .unwrap_or_else(|| std::path::PathBuf::from("."))
++        .join(".vctx")
++        .join("memory.db")
++        .to_string_lossy()
++        .to_string()
++}
++
++fn default_vctx_top_k() -> usize {
++    3
++}
++
++fn default_vctx_max_memory_chars() -> usize {
++    2400
++}
++
++fn default_vctx_checkpoint_min_chars() -> usize {
++    1200
++}
++
++impl Default for VctxMemoryConfig {
++    fn default() -> Self {
++        Self {
++            enabled: true,
++            db_path: default_vctx_db_path(),
++            recall_top_k: default_vctx_top_k(),
++            max_memory_chars: default_vctx_max_memory_chars(),
++            checkpoint_min_chars: default_vctx_checkpoint_min_chars(),
++        }
++    }
++}
++
+ /// 日志配置
+ ///
+ /// 存储在 settings 表的 log_config 字段中（JSON 格式）
+diff --git a/src-tauri/src/proxy/vctx_memory.rs b/src-tauri/src/proxy/vctx_memory.rs
+new file mode 100644
+index 0000000..2f587bb
+--- /dev/null
++++ b/src-tauri/src/proxy/vctx_memory.rs
+@@ -0,0 +1,427 @@
++use super::types::VctxMemoryConfig;
++use chrono::Utc;
++use rusqlite::{params, Connection, OptionalExtension};
++use serde_json::{json, Value};
++use sha2::{Digest, Sha256};
++use std::path::Path;
++
++#[derive(Debug)]
++struct MemoryBlock {
++    block_id: String,
++    title: String,
++    content: String,
++    conclusion: String,
++    keywords: String,
++    score: f64,
++}
++
++pub fn apply_request_memory(
++    body: &mut Value,
++    config: &VctxMemoryConfig,
++    session_id: &str,
++    app_type: &str,
++) {
++    if !config.enabled || body_already_has_vctx(body) {
++        return;
++    }
++
++    let Some(query) = extract_query_text(body) else {
++        return;
++    };
++
++    let db_path = Path::new(&config.db_path);
++    if !db_path.exists() {
++        return;
++    }
++
++    let memory = match recall_memory(db_path, &query, config) {
++        Ok(memory) => memory,
++        Err(err) => {
++            log::warn!("[VCTX] recall skipped: {err}");
++            return;
++        }
++    };
++
++    if memory.is_empty() {
++        return;
++    }
++
++    inject_memory(body, &memory, session_id, app_type);
++}
++
++pub fn maybe_checkpoint_response(
++    body_bytes: &[u8],
++    config: &VctxMemoryConfig,
++    session_id: &str,
++    app_type: &str,
++    model: &str,
++) {
++    if !config.enabled {
++        return;
++    }
++
++    let db_path = Path::new(&config.db_path);
++    let Ok(value) = serde_json::from_slice::<Value>(body_bytes) else {
++        return;
++    };
++    let text = extract_response_text(&value);
++    let text = text.trim();
++    if text.chars().count() < config.checkpoint_min_chars {
++        return;
++    }
++
++    if let Err(err) = archive_checkpoint(db_path, text, session_id, app_type, model) {
++        log::warn!("[VCTX] checkpoint skipped: {err}");
++    }
++}
++
++fn recall_memory(
++    db_path: &Path,
++    query: &str,
++    config: &VctxMemoryConfig,
++) -> Result<String, rusqlite::Error> {
++    let terms = tokenize(query);
++    if terms.is_empty() {
++        return Ok(String::new());
++    }
++
++    let conn = Connection::open(db_path)?;
++    let mut stmt = conn.prepare(
++        "SELECT block_id, title, content, conclusion, keywords, importance, access_count
++         FROM blocks
++         ORDER BY importance DESC, access_count DESC, created_at DESC
++         LIMIT 200",
++    )?;
++    let rows = stmt.query_map([], |row| {
++        let title: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
++        let content: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
++        let conclusion: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
++        let keywords: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
++        let importance = row.get::<_, Option<f64>>(5)?.unwrap_or(1.0);
++        let access_count = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
++        let searchable = format!("{title} {conclusion} {keywords}").to_lowercase();
++        let hits = terms
++            .iter()
++            .filter(|term| searchable.contains(term.as_str()))
++            .count() as f64;
++        let score = hits + importance * 0.05 + (access_count as f64).min(20.0) * 0.01;
++
++        Ok(MemoryBlock {
++            block_id: row.get(0)?,
++            title,
++            content,
++            conclusion,
++            keywords,
++            score,
++        })
++    })?;
++
++    let mut blocks = Vec::new();
++    for row in rows {
++        let block = row?;
++        if block.score >= 1.0 {
++            blocks.push(block);
++        }
++    }
++    blocks.sort_by(|a, b| b.score.total_cmp(&a.score));
++    blocks.truncate(config.recall_top_k.max(1));
++
++    let mut out = String::new();
++    let mut used = 0usize;
++    for block in blocks {
++        let excerpt = truncate_chars(&block.content, 900);
++        let chunk = format!(
++            "[{}] {}\nConclusion: {}\nKeywords: {}\nExcerpt: {}\n\n",
++            block.block_id, block.title, block.conclusion, block.keywords, excerpt
++        );
++        let chunk_len = chunk.chars().count();
++        if used + chunk_len > config.max_memory_chars && !out.is_empty() {
++            break;
++        }
++        used += chunk_len;
++        out.push_str(&chunk);
++    }
++
++    Ok(out.trim().to_string())
++}
++
++fn inject_memory(body: &mut Value, memory: &str, session_id: &str, app_type: &str) {
++    let text = format!(
++        "<VCTX_MEMORY session=\"{}\">\n{}\n</VCTX_MEMORY>",
++        escape_attr(session_id),
++        memory
++    );
++
++    if matches!(app_type, "claude" | "claude-desktop") {
++        inject_top_level_system(body, text);
++        return;
++    }
++
++    if let Some(system) = body.get_mut("system") {
++        match system {
++            Value::String(existing) => {
++                existing.push_str("\n\n");
++                existing.push_str(&text);
++            }
++            Value::Array(items) => {
++                items.push(json!({"type": "text", "text": text}));
++            }
++            _ => {
++                *system = Value::String(text);
++            }
++        }
++        log::info!("[VCTX] injected memory into top-level system");
++        return;
++    }
++
++    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
++        if let Some(system_msg) = messages
++            .iter_mut()
++            .find(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
++        {
++            append_message_content(system_msg, &text);
++        } else {
++            messages.insert(0, json!({"role": "system", "content": text}));
++        }
++        log::info!("[VCTX] injected memory into messages");
++    }
++}
++
++fn inject_top_level_system(body: &mut Value, text: String) {
++    match body.get_mut("system") {
++        Some(Value::String(existing)) => {
++            existing.push_str("\n\n");
++            existing.push_str(&text);
++        }
++        Some(Value::Array(items)) => {
++            items.push(json!({"type": "text", "text": text}));
++        }
++        Some(other) => {
++            *other = Value::String(text);
++        }
++        None => {
++            if let Some(obj) = body.as_object_mut() {
++                obj.insert("system".to_string(), Value::String(text));
++            }
++        }
++    }
++    log::info!("[VCTX] injected memory into top-level system");
++}
++
++fn archive_checkpoint(
++    db_path: &Path,
++    text: &str,
++    session_id: &str,
++    app_type: &str,
++    model: &str,
++) -> Result<(), rusqlite::Error> {
++    if let Some(parent) = db_path.parent() {
++        let _ = std::fs::create_dir_all(parent);
++    }
++
++    let conn = Connection::open(db_path)?;
++    conn.execute_batch(
++        "CREATE TABLE IF NOT EXISTS blocks (
++            block_id TEXT PRIMARY KEY,
++            title TEXT,
++            content TEXT NOT NULL,
++            token_count INTEGER,
++            keywords TEXT,
++            conclusion TEXT,
++            session_id TEXT,
++            project_id TEXT,
++            user_id TEXT,
++            source TEXT DEFAULT 'manual',
++            is_recalled INTEGER DEFAULT 0,
++            recall_from TEXT,
++            fingerprint TEXT,
++            embedding TEXT,
++            created_at TEXT,
++            last_access TEXT,
++            importance REAL DEFAULT 1.0,
++            access_count INTEGER DEFAULT 0
++        );
++        CREATE INDEX IF NOT EXISTS idx_blocks_fingerprint ON blocks(fingerprint);",
++    )?;
++
++    let fingerprint = sha256_hex(text);
++    let existing: Option<String> = conn
++        .query_row(
++            "SELECT block_id FROM blocks WHERE fingerprint=? LIMIT 1",
++            params![&fingerprint],
++            |row| row.get(0),
++        )
++        .optional()?;
++    if existing.is_some() {
++        return Ok(());
++    }
++
++    let now = Utc::now().to_rfc3339();
++    let block_id = format!("{}-{}", Utc::now().format("%y%m%d"), &fingerprint[..6]);
++    let title = format!("{} response checkpoint", app_type);
++    let conclusion = truncate_chars(text, 220);
++    let keywords = serde_json::to_string(&extract_keywords(text)).unwrap_or_else(|_| "[]".into());
++    let token_count = approx_tokens(text);
++    let content = format!("Model: {model}\n\n{text}");
++
++    conn.execute(
++        "INSERT INTO blocks
++         (block_id, title, content, token_count, keywords, conclusion,
++          session_id, project_id, user_id, source, is_recalled, recall_from,
++          fingerprint, embedding, created_at, last_access, importance, access_count)
++         VALUES (?, ?, ?, ?, ?, ?, ?, '', '', 'cc-switch-proxy', 0, NULL, ?, NULL, ?, ?, 1.0, 0)",
++        params![
++            block_id,
++            title,
++            content,
++            token_count,
++            keywords,
++            conclusion,
++            session_id,
++            fingerprint,
++            now,
++            now,
++        ],
++    )?;
++    log::info!("[VCTX] archived response checkpoint");
++    Ok(())
++}
++
++fn append_message_content(message: &mut Value, extra: &str) {
++    match message.get_mut("content") {
++        Some(Value::String(existing)) => {
++            existing.push_str("\n\n");
++            existing.push_str(extra);
++        }
++        Some(Value::Array(items)) => items.push(json!({"type": "text", "text": extra})),
++        Some(other) => *other = Value::String(extra.to_string()),
++        None => {
++            if let Some(obj) = message.as_object_mut() {
++                obj.insert("content".to_string(), Value::String(extra.to_string()));
++            }
++        }
++    }
++}
++
++fn body_already_has_vctx(body: &Value) -> bool {
++    body.to_string().contains("<VCTX_MEMORY")
++}
++
++fn extract_query_text(body: &Value) -> Option<String> {
++    let messages = body.get("messages")?.as_array()?;
++    messages.iter().rev().find_map(|msg| {
++        (msg.get("role").and_then(Value::as_str) == Some("user"))
++            .then(|| extract_content_text(msg.get("content").unwrap_or(&Value::Null)))
++            .filter(|text| !text.trim().is_empty())
++    })
++}
++
++fn extract_response_text(value: &Value) -> String {
++    let mut parts = Vec::new();
++    if let Some(content) = value.get("content") {
++        collect_text(content, &mut parts);
++    }
++    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
++        for choice in choices {
++            if let Some(message) = choice.get("message") {
++                collect_text(message.get("content").unwrap_or(message), &mut parts);
++            }
++            if let Some(delta) = choice.get("delta") {
++                collect_text(delta.get("content").unwrap_or(delta), &mut parts);
++            }
++        }
++    }
++    if let Some(output) = value.get("output") {
++        collect_text(output, &mut parts);
++    }
++    if let Some(output_text) = value.get("output_text").and_then(Value::as_str) {
++        parts.push(output_text.to_string());
++    }
++    parts.join("\n")
++}
++
++fn extract_content_text(value: &Value) -> String {
++    let mut parts = Vec::new();
++    collect_text(value, &mut parts);
++    parts.join("\n")
++}
++
++fn collect_text(value: &Value, parts: &mut Vec<String>) {
++    match value {
++        Value::String(text) => parts.push(text.clone()),
++        Value::Array(items) => {
++            for item in items {
++                collect_text(item, parts);
++            }
++        }
++        Value::Object(map) => {
++            if let Some(text) = map.get("text").and_then(Value::as_str) {
++                parts.push(text.to_string());
++            } else if let Some(content) = map.get("content") {
++                collect_text(content, parts);
++            }
++        }
++        _ => {}
++    }
++}
++
++fn tokenize(text: &str) -> Vec<String> {
++    let mut terms = Vec::new();
++    let mut current = String::new();
++    for ch in text.to_lowercase().chars() {
++        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
++            current.push(ch);
++        } else {
++            if current.chars().count() >= 2 {
++                terms.push(current.clone());
++            }
++            current.clear();
++            if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
++                terms.push(ch.to_string());
++            }
++        }
++    }
++    if current.chars().count() >= 2 {
++        terms.push(current);
++    }
++    terms.sort();
++    terms.dedup();
++    terms
++}
++
++fn extract_keywords(text: &str) -> Vec<String> {
++    let mut terms = tokenize(text);
++    terms.retain(|term| term.chars().count() >= 2);
++    terms.truncate(12);
++    terms
++}
++
++fn truncate_chars(text: &str, max_chars: usize) -> String {
++    let mut out: String = text.chars().take(max_chars).collect();
++    if text.chars().count() > max_chars {
++        out.push_str("...");
++    }
++    out
++}
++
++fn approx_tokens(text: &str) -> usize {
++    let cjk = text
++        .chars()
++        .filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch))
++        .count();
++    let total = text.chars().count();
++    cjk + total.saturating_sub(cjk) / 4
++}
++
++fn sha256_hex(text: &str) -> String {
++    let mut hasher = Sha256::new();
++    hasher.update(text.as_bytes());
++    format!("{:x}", hasher.finalize())
++}
++
++fn escape_attr(text: &str) -> String {
++    text.replace('&', "&amp;")
++        .replace('"', "&quot;")
++        .replace('<', "&lt;")
++        .replace('>', "&gt;")
++}
