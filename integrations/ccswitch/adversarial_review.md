@@ -2,9 +2,9 @@
 
 ## Verdict
 
-Prototype viability: plausible, with local compile and unit-test evidence. It is
-not yet proven production-ready until one real Claude Code Desktop turn is
-observed through a patched CC Switch process with VCTX logs enabled.
+Prototype viability: plausible, with local compile, unit-test, and patched-proxy
+live request evidence. It is still a prototype until the integration is turned
+into a maintained CC Switch plugin or upstreamable feature with UI controls.
 
 The design logic is sound: VCTX belongs in the proxy hot path, not in MCP/Skill
 instructions, because only the proxy reliably sees every request and response.
@@ -55,8 +55,8 @@ Cases needing extra testing:
 - Architecture: medium-high.
 - Patch compile/unit-test correctness: medium-high on the tested CC Switch
   checkout.
-- End-to-end usability through Claude Code Desktop + patched CC Switch + Mimo:
-  medium, pending live patched-process log verification.
+- End-to-end usability through patched CC Switch + Mimo-compatible routing:
+  medium-high for non-streaming requests on the tested machine.
 
 ## Local Validation Run
 
@@ -83,6 +83,20 @@ Observed checks:
 - Direct Anthropic-compatible request through CC Switch:
   - Endpoint: `POST http://127.0.0.1:15721/v1/messages`
   - Result: response returned with `model="mimo-v2.5-pro"`.
+- Patched debug binary was built at:
+  - `src-tauri/target/debug/cc-switch.exe`
+  - `pnpm tauri build --debug` produced the executable and bundles; final
+    command exit was non-zero only because Tauri signing key was not configured.
+- Patched debug binary was temporarily run on `127.0.0.1:15721`:
+  - `/health`: healthy.
+  - A request containing only the diagnostic keyword
+    `codex-read-test-1782899627` caused the routed Mimo response to expose the
+    injected VCTX answer token `READBACK_OK_7319`.
+  - A long non-streaming response created one new SQLite block with
+    `source='cc-switch-proxy'`, title `claude response checkpoint`, and model
+    `mimo-v2.5-pro`.
+  - The original installed `C:\CCswitch\cc-switch.exe` process was restored and
+    `/health` returned healthy afterward.
 
 Checks not completed:
 
@@ -100,7 +114,10 @@ Interpretation:
 
 The current machine can route CC Switch traffic to Mimo, the extracted VCTX
 patch applies cleanly to CC Switch source, patched CC Switch type-checks with
-both GNU and native MSVC toolchains, and VCTX injection/checkpoint unit tests
-pass under MSVC. The remaining blocker for "can be used normally" is running a
-patched CC Switch binary and observing live `[VCTX] injected memory` logs from
-Claude Code Desktop traffic.
+both GNU and native MSVC toolchains, VCTX injection/checkpoint unit tests pass
+under MSVC, and a patched CC Switch debug binary successfully injected recall
+memory and archived a response checkpoint while routing to `mimo-v2.5-pro`.
+
+The remaining blocker for "daily use" is packaging this as a controllable
+integration instead of a source patch: UI toggle, project/user scoping, SSE
+checkpoint support, and less fragile recall scoring.
