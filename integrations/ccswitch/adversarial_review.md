@@ -2,9 +2,9 @@
 
 ## Verdict
 
-Prototype viability: plausible, but not proven production-ready until the patch
-passes `cargo check` inside a Rust-enabled CC Switch checkout and one real
-Claude Code Desktop turn is observed through CC Switch logs.
+Prototype viability: plausible, with local compile and unit-test evidence. It is
+not yet proven production-ready until one real Claude Code Desktop turn is
+observed through a patched CC Switch process with VCTX logs enabled.
 
 The design logic is sound: VCTX belongs in the proxy hot path, not in MCP/Skill
 instructions, because only the proxy reliably sees every request and response.
@@ -53,9 +53,10 @@ Cases needing extra testing:
 ## Current Confidence
 
 - Architecture: medium-high.
-- Patch correctness without Rust compile: medium-low.
-- End-to-end usability through Claude Code Desktop + CC Switch + Mimo: medium,
-  pending live log verification.
+- Patch compile/unit-test correctness: medium-high on the tested CC Switch
+  checkout.
+- End-to-end usability through Claude Code Desktop + patched CC Switch + Mimo:
+  medium, pending live patched-process log verification.
 
 ## Local Validation Run
 
@@ -70,6 +71,12 @@ Observed checks:
 - `cargo check --target x86_64-pc-windows-gnu`: passed for patched CC Switch.
 - `cargo check --tests --target x86_64-pc-windows-gnu`: passed for patched CC
   Switch, including VCTX middleware test code type-checking.
+- Native MSVC `cargo check`: passed for patched CC Switch after installing
+  Visual Studio Build Tools VCTools.
+- Native MSVC `cargo test --lib vctx_memory`: passed.
+  - `injects_claude_memory_into_top_level_system`: passed.
+  - `injects_openai_memory_into_system_message`: passed.
+  - `checkpoint_writes_vctx_block`: passed.
 - CC Switch local proxy health:
   - `GET http://127.0.0.1:15721/health`: healthy.
   - `GET http://127.0.0.1:15721/status`: running.
@@ -84,13 +91,16 @@ Checks not completed:
 - `cargo test --target x86_64-pc-windows-gnu`: reached link stage but failed
   because Tauri emitted MSVC-style `/MANIFEST` linker arguments to the GNU
   linker. This is a local Windows toolchain issue, not a VCTX type-check error.
-- Native MSVC `cargo check`: blocked by missing `link.exe`; Visual Studio Build
-  Tools install was attempted, then GNU target was used successfully for checks.
+- Native MSVC full `cargo test vctx_memory`: began compiling unrelated
+  integration-test targets and failed with stale/mixed target artifacts plus
+  Windows pagefile error `os error 1455`. The scoped library command
+  `cargo test --lib vctx_memory` passed.
 
 Interpretation:
 
 The current machine can route CC Switch traffic to Mimo, the extracted VCTX
-patch applies cleanly to CC Switch source, and patched CC Switch type-checks
-successfully with Rust GNU target. The remaining blocker for "can be used
-normally" is running a patched CC Switch binary and observing live
-`[VCTX] injected memory` logs from Claude Code Desktop traffic.
+patch applies cleanly to CC Switch source, patched CC Switch type-checks with
+both GNU and native MSVC toolchains, and VCTX injection/checkpoint unit tests
+pass under MSVC. The remaining blocker for "can be used normally" is running a
+patched CC Switch binary and observing live `[VCTX] injected memory` logs from
+Claude Code Desktop traffic.
