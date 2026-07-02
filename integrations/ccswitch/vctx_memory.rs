@@ -425,3 +425,69 @@ fn escape_attr(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn config_for(path: &Path) -> VctxMemoryConfig {
+        VctxMemoryConfig {
+            enabled: true,
+            db_path: path.to_string_lossy().to_string(),
+            recall_top_k: 3,
+            max_memory_chars: 2400,
+            checkpoint_min_chars: 10,
+        }
+    }
+
+    #[test]
+    fn injects_claude_memory_into_top_level_system() {
+        let mut body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "remember alpha"}]
+        });
+
+        inject_memory(&mut body, "alpha memory", "s1", "claude");
+
+        assert!(body.get("system").is_some());
+        assert!(body["system"].as_str().unwrap().contains("<VCTX_MEMORY"));
+        assert!(!body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|msg| msg.get("role").and_then(Value::as_str) == Some("system")));
+    }
+
+    #[test]
+    fn injects_openai_memory_into_system_message() {
+        let mut body = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "remember beta"}]
+        });
+
+        inject_memory(&mut body, "beta memory", "s1", "codex");
+
+        let first = &body["messages"].as_array().unwrap()[0];
+        assert_eq!(first["role"], "system");
+        assert!(first["content"].as_str().unwrap().contains("<VCTX_MEMORY"));
+    }
+
+    #[test]
+    fn checkpoint_writes_vctx_block() {
+        let file = NamedTempFile::new().unwrap();
+        let config = config_for(file.path());
+        let body = json!({
+            "content": [{"type": "text", "text": "This is a long enough checkpoint body for VCTX."}]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+
+        maybe_checkpoint_response(&bytes, &config, "session-a", "claude", "mimo-v2.5-pro");
+
+        let conn = Connection::open(file.path()).unwrap();
+        let source: String = conn
+            .query_row("SELECT source FROM blocks LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source, "cc-switch-proxy");
+    }
+}

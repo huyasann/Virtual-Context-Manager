@@ -67,6 +67,9 @@ Observed checks:
 - `git apply --check integrations/ccswitch/ccswitch-vctx.patch` against a clean
   local CC Switch clone: passed.
 - Existing `proxy_smoke_test.py`: passed in the `pytorch_env` conda environment.
+- `cargo check --target x86_64-pc-windows-gnu`: passed for patched CC Switch.
+- `cargo check --tests --target x86_64-pc-windows-gnu`: passed for patched CC
+  Switch, including VCTX middleware test code type-checking.
 - CC Switch local proxy health:
   - `GET http://127.0.0.1:15721/health`: healthy.
   - `GET http://127.0.0.1:15721/status`: running.
@@ -76,13 +79,18 @@ Observed checks:
 
 Checks not completed:
 
-- `cargo check`: local shell did not have `cargo`.
 - Existing `smoke_test.py`: timed out locally after 124 seconds in this run.
 - Live Claude Code Desktop UI observation: not automated from this repository.
+- `cargo test --target x86_64-pc-windows-gnu`: reached link stage but failed
+  because Tauri emitted MSVC-style `/MANIFEST` linker arguments to the GNU
+  linker. This is a local Windows toolchain issue, not a VCTX type-check error.
+- Native MSVC `cargo check`: blocked by missing `link.exe`; Visual Studio Build
+  Tools install was attempted, then GNU target was used successfully for checks.
 
 Interpretation:
 
-The current machine can route CC Switch traffic to Mimo, and the extracted VCTX
-patch applies cleanly to CC Switch source. The remaining blocker for "can be
-used normally" is Rust compilation plus installing/running the patched CC Switch
-binary.
+The current machine can route CC Switch traffic to Mimo, the extracted VCTX
+patch applies cleanly to CC Switch source, and patched CC Switch type-checks
+successfully with Rust GNU target. The remaining blocker for "can be used
+normally" is running a patched CC Switch binary and observing live
+`[VCTX] injected memory` logs from Claude Code Desktop traffic.
