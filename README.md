@@ -113,6 +113,18 @@ python proxy_live_test.py --proxy-url http://127.0.0.1:8787 --model claude-sonne
 The live test seeds a diagnostic VCTX block, verifies readback through the model,
 and checks that a long response creates a `source='vctx-proxy'` checkpoint.
 
+Deep Mimo/CC Switch verification:
+
+```bash
+set VCTX_UPSTREAM_BASE_URL=http://127.0.0.1:15721
+python proxy.py --host 127.0.0.1 --port 8787
+python proxy_mimo_deep_test.py --proxy-url http://127.0.0.1:8787 --model claude-sonnet-4-5 --try-openai
+```
+
+This deeper test checks project-isolated recall, unrelated recall suppression,
+non-streaming readback, streaming readback, non-streaming checkpointing, and
+streaming checkpointing against the Mimo route exposed by CC Switch.
+
 ### CC Switch Integration Prototype
 
 The portable CC Switch middleware experiment lives in:
