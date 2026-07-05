@@ -14,6 +14,8 @@ import json
 import os
 import re
 import sqlite3
+import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +75,30 @@ def db_conn():
                 access_count  INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_blocks_fingerprint ON blocks(fingerprint);
+            CREATE TABLE IF NOT EXISTS proxy_trace (
+                trace_id           TEXT PRIMARY KEY,
+                started_at         TEXT,
+                finished_at        TEXT,
+                duration_ms        INTEGER,
+                protocol           TEXT,
+                path               TEXT,
+                stream             INTEGER DEFAULT 0,
+                project_id         TEXT,
+                user_id            TEXT,
+                session_id         TEXT,
+                query_preview      TEXT,
+                recalled_block_ids TEXT,
+                recalled_scores    TEXT,
+                injected           INTEGER DEFAULT 0,
+                checkpoint_block_id TEXT,
+                checkpoint_status  TEXT,
+                upstream_status    INTEGER,
+                error              TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_proxy_trace_started
+                ON proxy_trace(started_at);
+            CREATE INDEX IF NOT EXISTS idx_proxy_trace_project
+                ON proxy_trace(project_id);
             """
         )
         migrate_schema(conn)
@@ -97,6 +123,17 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     for name, ddl in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE blocks ADD COLUMN {name} {ddl}")
+
+    existing_trace = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(proxy_trace)").fetchall()
+    }
+    trace_columns = {
+        "checkpoint_status": "TEXT",
+    }
+    for name, ddl in trace_columns.items():
+        if name not in existing_trace:
+            conn.execute(f"ALTER TABLE proxy_trace ADD COLUMN {name} {ddl}")
 
 
 def rough_tokens(text: str) -> int:
@@ -251,6 +288,84 @@ def request_scope(request: Request) -> dict[str, str]:
     if not session_id:
         session_id = project_id or user_id or "vctx-proxy"
     return {"project_id": project_id, "user_id": user_id, "session_id": session_id}
+
+
+def preview_text(text: str, limit: int = 320) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return text[:limit]
+
+
+def start_trace(
+    *,
+    protocol: str,
+    path: str,
+    stream: bool,
+    scope: dict[str, str],
+    user_text: str,
+    memories: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "trace_id": uuid.uuid4().hex[:16],
+        "started_at": datetime.now().isoformat(),
+        "started_monotonic": time.perf_counter(),
+        "protocol": protocol,
+        "path": path,
+        "stream": stream,
+        "project_id": scope["project_id"],
+        "user_id": scope["user_id"],
+        "session_id": scope["session_id"],
+        "query_preview": preview_text(user_text),
+        "recalled_block_ids": [memory["block_id"] for memory in memories],
+        "recalled_scores": [round(float(memory.get("score") or 0.0), 3) for memory in memories],
+        "injected": bool(memories),
+        "checkpoint_status": "not_attempted",
+    }
+
+
+def finish_trace(
+    trace: dict[str, Any],
+    *,
+    upstream_status: int | None = None,
+    checkpoint_block_id: str | None = None,
+    checkpoint_status: str | None = None,
+    error: str = "",
+) -> None:
+    finished_at = datetime.now().isoformat()
+    duration_ms = int((time.perf_counter() - float(trace["started_monotonic"])) * 1000)
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO proxy_trace
+                (trace_id, started_at, finished_at, duration_ms, protocol, path,
+                 stream, project_id, user_id, session_id, query_preview,
+                 recalled_block_ids, recalled_scores, injected, checkpoint_block_id,
+                 checkpoint_status, upstream_status, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trace["trace_id"],
+                    trace["started_at"],
+                    finished_at,
+                    duration_ms,
+                    trace["protocol"],
+                    trace["path"],
+                    1 if trace["stream"] else 0,
+                    trace["project_id"],
+                    trace["user_id"],
+                    trace["session_id"],
+                    trace["query_preview"],
+                    json.dumps(trace["recalled_block_ids"], ensure_ascii=False),
+                    json.dumps(trace["recalled_scores"], ensure_ascii=False),
+                    1 if trace["injected"] else 0,
+                    checkpoint_block_id or "",
+                    checkpoint_status or trace.get("checkpoint_status") or "not_attempted",
+                    upstream_status,
+                    preview_text(error, limit=600),
+                ),
+            )
+    except Exception as exc:
+        print(f"[vctx-proxy] trace write skipped: {exc}")
 
 
 def extract_openai_user_text(payload: dict[str, Any]) -> str:
@@ -512,22 +627,38 @@ async def forward_stream(
     user_text: str,
     scope: dict[str, str],
     protocol: str,
+    trace: dict[str, Any],
 ) -> StreamingResponse:
     client = httpx.AsyncClient(timeout=None)
-    upstream = client.stream("POST", upstream_url(path), headers=upstream_headers(request), json=payload)
-    response = await upstream.__aenter__()
+    try:
+        upstream = client.stream("POST", upstream_url(path), headers=upstream_headers(request), json=payload)
+        response = await upstream.__aenter__()
+    except Exception as exc:
+        await client.aclose()
+        finish_trace(trace, error=str(exc))
+        raise
     collected = bytearray()
 
     async def iterator():
+        checkpoint_block_id = None
+        checkpoint_status = "not_attempted"
+        error = ""
         try:
             async for chunk in response.aiter_bytes():
                 if CHECKPOINT_STREAMING:
                     collected.extend(chunk)
                 yield chunk
+        except Exception as exc:
+            error = str(exc)
+            raise
         finally:
-            if CHECKPOINT_STREAMING and 200 <= response.status_code < 300:
+            if not CHECKPOINT_STREAMING:
+                checkpoint_status = "disabled"
+            elif not (200 <= response.status_code < 300):
+                checkpoint_status = "skipped_upstream_status"
+            else:
                 assistant_text = extract_sse_text(bytes(collected), protocol)
-                maybe_checkpoint(
+                checkpoint_block_id = maybe_checkpoint(
                     user_text,
                     assistant_text,
                     session_id=scope["session_id"],
@@ -535,6 +666,14 @@ async def forward_stream(
                     user_id=scope["user_id"],
                     protocol=f"{protocol}-stream",
                 )
+                checkpoint_status = "saved" if checkpoint_block_id else "skipped_threshold"
+            finish_trace(
+                trace,
+                upstream_status=response.status_code,
+                checkpoint_block_id=checkpoint_block_id,
+                checkpoint_status=checkpoint_status,
+                error=error,
+            )
             await upstream.__aexit__(None, None, None)
             await client.aclose()
 
@@ -569,6 +708,7 @@ async def vctx_status() -> dict[str, Any]:
         proxy_blocks = conn.execute(
             "SELECT COUNT(*) FROM blocks WHERE source='vctx-proxy'"
         ).fetchone()[0]
+        trace_count = conn.execute("SELECT COUNT(*) FROM proxy_trace").fetchone()[0]
         projects = [
             row[0] or ""
             for row in conn.execute(
@@ -580,9 +720,55 @@ async def vctx_status() -> dict[str, Any]:
         "db": str(DB_PATH),
         "blocks": total,
         "proxy_checkpoints": proxy_blocks,
+        "proxy_traces": trace_count,
         "projects": projects,
         "turn_buffers": {key: len(value) for key, value in _turn_buffers.items()},
     }
+
+
+def trace_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "trace_id": row["trace_id"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "duration_ms": row["duration_ms"],
+        "protocol": row["protocol"],
+        "path": row["path"],
+        "stream": bool(row["stream"]),
+        "project_id": row["project_id"] or "",
+        "user_id": row["user_id"] or "",
+        "session_id": row["session_id"] or "",
+        "query_preview": row["query_preview"] or "",
+        "recalled_block_ids": parse_keywords(row["recalled_block_ids"]),
+        "recalled_scores": parse_keywords(row["recalled_scores"]),
+        "injected": bool(row["injected"]),
+        "checkpoint_block_id": row["checkpoint_block_id"] or "",
+        "checkpoint_status": row["checkpoint_status"] or "",
+        "upstream_status": row["upstream_status"],
+        "error": row["error"] or "",
+    }
+
+
+@app.get("/vctx/traces")
+async def vctx_traces(limit: int = 20, project: str = "") -> dict[str, Any]:
+    limit = max(1, min(int(limit), 200))
+    filters: list[str] = []
+    params: list[Any] = []
+    if project:
+        filters.append("COALESCE(project_id, '') = ?")
+        params.append(project)
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with db_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM proxy_trace
+            {where}
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+    return {"count": len(rows), "traces": [trace_row_to_dict(row) for row in rows]}
 
 
 @app.post("/vctx/recall")
@@ -608,6 +794,14 @@ async def openai_chat_completions(request: Request) -> Response:
     user_text = extract_openai_user_text(payload)
     memories = recall_memory(user_text, project_id=scope["project_id"], user_id=scope["user_id"])
     injected = inject_openai_memory(payload, format_memory(memories))
+    trace = start_trace(
+        protocol="openai",
+        path="/v1/chat/completions",
+        stream=bool(payload.get("stream")),
+        scope=scope,
+        user_text=user_text,
+        memories=memories,
+    )
 
     if payload.get("stream"):
         return await forward_stream(
@@ -617,34 +811,55 @@ async def openai_chat_completions(request: Request) -> Response:
             user_text=user_text,
             scope=scope,
             protocol="openai",
+            trace=trace,
         )
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        upstream_response = await client.post(
-            upstream_url("/v1/chat/completions"),
-            headers=upstream_headers(request),
-            json=injected,
-        )
-
+    checkpoint_block_id = None
+    checkpoint_status = "not_attempted"
     try:
-        data = upstream_response.json()
-    except json.JSONDecodeError:
-        return Response(
-            status_code=upstream_response.status_code,
-            content=upstream_response.content,
-            media_type=upstream_response.headers.get("content-type"),
-        )
+        async with httpx.AsyncClient(timeout=None) as client:
+            upstream_response = await client.post(
+                upstream_url("/v1/chat/completions"),
+                headers=upstream_headers(request),
+                json=injected,
+            )
 
-    if upstream_response.is_success:
-        maybe_checkpoint(
-            user_text,
-            extract_openai_assistant_text(data),
-            session_id=scope["session_id"],
-            project_id=scope["project_id"],
-            user_id=scope["user_id"],
-            protocol="openai",
+        try:
+            data = upstream_response.json()
+        except json.JSONDecodeError:
+            finish_trace(
+                trace,
+                upstream_status=upstream_response.status_code,
+                checkpoint_status="skipped_non_json",
+            )
+            return Response(
+                status_code=upstream_response.status_code,
+                content=upstream_response.content,
+                media_type=upstream_response.headers.get("content-type"),
+            )
+
+        if upstream_response.is_success:
+            checkpoint_block_id = maybe_checkpoint(
+                user_text,
+                extract_openai_assistant_text(data),
+                session_id=scope["session_id"],
+                project_id=scope["project_id"],
+                user_id=scope["user_id"],
+                protocol="openai",
+            )
+            checkpoint_status = "saved" if checkpoint_block_id else "skipped_threshold"
+        else:
+            checkpoint_status = "skipped_upstream_status"
+        finish_trace(
+            trace,
+            upstream_status=upstream_response.status_code,
+            checkpoint_block_id=checkpoint_block_id,
+            checkpoint_status=checkpoint_status,
         )
-    return JSONResponse(status_code=upstream_response.status_code, content=data)
+        return JSONResponse(status_code=upstream_response.status_code, content=data)
+    except Exception as exc:
+        finish_trace(trace, error=str(exc))
+        raise
 
 
 @app.post("/v1/messages")
@@ -654,6 +869,14 @@ async def anthropic_messages(request: Request) -> Response:
     user_text = extract_anthropic_user_text(payload)
     memories = recall_memory(user_text, project_id=scope["project_id"], user_id=scope["user_id"])
     injected = inject_anthropic_memory(payload, format_memory(memories))
+    trace = start_trace(
+        protocol="anthropic",
+        path="/v1/messages",
+        stream=bool(payload.get("stream")),
+        scope=scope,
+        user_text=user_text,
+        memories=memories,
+    )
 
     if payload.get("stream"):
         return await forward_stream(
@@ -663,34 +886,55 @@ async def anthropic_messages(request: Request) -> Response:
             user_text=user_text,
             scope=scope,
             protocol="anthropic",
+            trace=trace,
         )
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        upstream_response = await client.post(
-            upstream_url("/v1/messages"),
-            headers=upstream_headers(request),
-            json=injected,
-        )
-
+    checkpoint_block_id = None
+    checkpoint_status = "not_attempted"
     try:
-        data = upstream_response.json()
-    except json.JSONDecodeError:
-        return Response(
-            status_code=upstream_response.status_code,
-            content=upstream_response.content,
-            media_type=upstream_response.headers.get("content-type"),
-        )
+        async with httpx.AsyncClient(timeout=None) as client:
+            upstream_response = await client.post(
+                upstream_url("/v1/messages"),
+                headers=upstream_headers(request),
+                json=injected,
+            )
 
-    if upstream_response.is_success:
-        maybe_checkpoint(
-            user_text,
-            extract_anthropic_assistant_text(data),
-            session_id=scope["session_id"],
-            project_id=scope["project_id"],
-            user_id=scope["user_id"],
-            protocol="anthropic",
+        try:
+            data = upstream_response.json()
+        except json.JSONDecodeError:
+            finish_trace(
+                trace,
+                upstream_status=upstream_response.status_code,
+                checkpoint_status="skipped_non_json",
+            )
+            return Response(
+                status_code=upstream_response.status_code,
+                content=upstream_response.content,
+                media_type=upstream_response.headers.get("content-type"),
+            )
+
+        if upstream_response.is_success:
+            checkpoint_block_id = maybe_checkpoint(
+                user_text,
+                extract_anthropic_assistant_text(data),
+                session_id=scope["session_id"],
+                project_id=scope["project_id"],
+                user_id=scope["user_id"],
+                protocol="anthropic",
+            )
+            checkpoint_status = "saved" if checkpoint_block_id else "skipped_threshold"
+        else:
+            checkpoint_status = "skipped_upstream_status"
+        finish_trace(
+            trace,
+            upstream_status=upstream_response.status_code,
+            checkpoint_block_id=checkpoint_block_id,
+            checkpoint_status=checkpoint_status,
         )
-    return JSONResponse(status_code=upstream_response.status_code, content=data)
+        return JSONResponse(status_code=upstream_response.status_code, content=data)
+    except Exception as exc:
+        finish_trace(trace, error=str(exc))
+        raise
 
 
 def main() -> None:

@@ -87,6 +87,7 @@ Debug endpoints:
 ```text
 GET  /healthz
 GET  /vctx/status
+GET  /vctx/traces
 POST /vctx/recall
 ```
 
@@ -124,6 +125,17 @@ python proxy_mimo_deep_test.py --proxy-url http://127.0.0.1:8787 --model claude-
 This deeper test checks project-isolated recall, unrelated recall suppression,
 non-streaming readback, streaming readback, non-streaming checkpointing, and
 streaming checkpointing against the Mimo route exposed by CC Switch.
+
+Trace report:
+
+```bash
+python proxy_trace_report.py --project mimo-deep-test --limit 20
+```
+
+Proxy traces are stored in the same SQLite database as `blocks`, in the
+`proxy_trace` table. They record protocol, path, project/session scope, recall
+block IDs/scores, injection status, upstream status, checkpoint status, and
+checkpoint block ID.
 
 ### CC Switch Integration Prototype
 

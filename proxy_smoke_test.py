@@ -76,6 +76,34 @@ def main() -> int:
         checkpoint = proxy.recall_memory("write long response", project_id="alpha", min_score=1.0)
         assert checkpoint, "expected checkpoint to be searchable"
 
+        trace = proxy.start_trace(
+            protocol="openai",
+            path="/v1/chat/completions",
+            stream=False,
+            scope={"project_id": "alpha", "user_id": "", "session_id": "s1"},
+            user_text="deployment target answer token",
+            memories=alpha,
+        )
+        proxy.finish_trace(
+            trace,
+            upstream_status=200,
+            checkpoint_block_id=block_id,
+            checkpoint_status="saved",
+        )
+        with proxy.db_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM proxy_trace WHERE trace_id=?",
+                (trace["trace_id"],),
+            ).fetchone()
+            assert row is not None, "expected proxy trace row"
+            assert row["project_id"] == "alpha"
+            assert row["injected"] == 1
+            assert row["checkpoint_status"] == "saved"
+            assert row["checkpoint_block_id"] == block_id
+            assert "ALPHA_K8S_2026" not in row["query_preview"]
+            recalled = proxy.parse_keywords(row["recalled_block_ids"])
+            assert alpha[0]["block_id"] in recalled
+
         raw_sse = (
             b"data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\n"
             b"data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\n"

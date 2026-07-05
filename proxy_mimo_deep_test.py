@@ -16,6 +16,7 @@ import json
 import sqlite3
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
@@ -58,6 +59,12 @@ def http_error_detail(exc: urllib.error.HTTPError) -> str:
 def get_json(url: str, timeout: int = 30) -> Any:
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def get_project_traces(base_url: str, project: str, limit: int = 50) -> list[dict[str, Any]]:
+    query = urllib.parse.urlencode({"project": project, "limit": limit})
+    data = get_json(f"{base_url.rstrip('/')}/vctx/traces?{query}")
+    return data.get("traces", [])
 
 
 def post_stream(url: str, body: dict[str, Any], headers: dict[str, str], timeout: int = 240) -> tuple[str, str]:
@@ -245,6 +252,28 @@ def run(args: argparse.Namespace) -> list[Check]:
             f"stream checkpoint failed: before={before_stream}, after={after_stream}, stream_len={len(long_stream_text)}"
         )
     checks.append(Check("stream_checkpoint", "passed", f"{before_stream}->{after_stream}, text_len={len(long_stream_text)}"))
+
+    traces = get_project_traces(base, project)
+    if not traces:
+        raise RuntimeError("expected proxy traces for project")
+    if not any(
+        trace.get("protocol") == "anthropic"
+        and trace.get("path") == "/v1/messages"
+        and not trace.get("stream")
+        and trace.get("injected")
+        and trace.get("upstream_status") == 200
+        for trace in traces
+    ):
+        raise RuntimeError(f"missing non-stream injected trace: {json.dumps(traces[:5], ensure_ascii=False)}")
+    if not any(
+        trace.get("protocol") == "anthropic"
+        and trace.get("stream")
+        and trace.get("checkpoint_status") == "saved"
+        and trace.get("checkpoint_block_id")
+        for trace in traces
+    ):
+        raise RuntimeError(f"missing stream checkpoint trace: {json.dumps(traces[:5], ensure_ascii=False)}")
+    checks.append(Check("proxy_trace_records", "passed", f"count={len(traces)}"))
 
     if args.try_openai:
         try:
