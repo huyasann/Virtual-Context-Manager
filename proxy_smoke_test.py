@@ -49,6 +49,24 @@ def main() -> int:
         unrelated = proxy.recall_memory("banana smoothie recipe", project_id="alpha")
         assert unrelated == [], unrelated
 
+        normal_probe = proxy.compact_probe(
+            {"messages": [{"role": "user", "content": "hello world"}]},
+            "hello world",
+        )
+        assert not normal_probe["candidate"], normal_probe
+        compact_probe = proxy.compact_probe(
+            {
+                "system": "This is a conversation summary from previous conversation after context window compaction.",
+                "messages": [
+                    {"role": "user", "content": "Continue from the summary and recover important project decisions."}
+                ],
+            },
+            "Continue from the summary and recover important project decisions.",
+        )
+        assert compact_probe["candidate"], compact_probe
+        assert compact_probe["request_chars"] > 0
+        assert compact_probe["message_count"] == 1
+
         openai_payload = {
             "model": "test",
             "messages": [{"role": "user", "content": "deployment target answer token"}],
@@ -83,6 +101,7 @@ def main() -> int:
             scope={"project_id": "alpha", "user_id": "", "session_id": "s1"},
             user_text="deployment target answer token",
             memories=alpha,
+            compact=compact_probe,
         )
         proxy.finish_trace(
             trace,
@@ -100,6 +119,8 @@ def main() -> int:
             assert row["injected"] == 1
             assert row["checkpoint_status"] == "saved"
             assert row["checkpoint_block_id"] == block_id
+            assert row["compact_candidate"] == 1
+            assert "phrase:conversation summary" in proxy.parse_keywords(row["compact_reason"])
             assert "ALPHA_K8S_2026" not in row["query_preview"]
             recalled = proxy.parse_keywords(row["recalled_block_ids"])
             assert alpha[0]["block_id"] in recalled

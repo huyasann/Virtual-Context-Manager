@@ -87,6 +87,10 @@ def db_conn():
                 user_id            TEXT,
                 session_id         TEXT,
                 query_preview      TEXT,
+                request_chars      INTEGER,
+                message_count      INTEGER,
+                compact_candidate  INTEGER DEFAULT 0,
+                compact_reason     TEXT,
                 recalled_block_ids TEXT,
                 recalled_scores    TEXT,
                 injected           INTEGER DEFAULT 0,
@@ -130,6 +134,10 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     }
     trace_columns = {
         "checkpoint_status": "TEXT",
+        "request_chars": "INTEGER",
+        "message_count": "INTEGER",
+        "compact_candidate": "INTEGER DEFAULT 0",
+        "compact_reason": "TEXT",
     }
     for name, ddl in trace_columns.items():
         if name not in existing_trace:
@@ -295,6 +303,80 @@ def preview_text(text: str, limit: int = 320) -> str:
     return text[:limit]
 
 
+def payload_text_parts(payload: dict[str, Any]) -> list[str]:
+    parts: list[str] = []
+    system = payload.get("system")
+    if isinstance(system, str):
+        parts.append(system)
+    elif isinstance(system, list):
+        parts.append(content_to_text(system))
+    for message in payload.get("messages", []) or []:
+        if isinstance(message, dict):
+            parts.append(content_to_text(message.get("content")))
+    return [part for part in parts if part]
+
+
+def payload_message_count(payload: dict[str, Any]) -> int:
+    messages = payload.get("messages", [])
+    return len(messages) if isinstance(messages, list) else 0
+
+
+def compact_probe(payload: dict[str, Any], user_text: str) -> dict[str, Any]:
+    parts = payload_text_parts(payload)
+    all_text = "\n".join(parts)
+    lowered = all_text.lower()
+    request_chars = len(all_text)
+    message_count = payload_message_count(payload)
+    reasons: list[str] = []
+
+    phrase_patterns = [
+        "conversation summary",
+        "summary of the conversation",
+        "previous conversation",
+        "conversation so far",
+        "context window",
+        "compact",
+        "compaction",
+        "auto-compact",
+        "summarize the conversation",
+        "summarise the conversation",
+        "压缩",
+        "上下文压缩",
+        "对话总结",
+        "总结当前对话",
+    ]
+    for pattern in phrase_patterns:
+        if pattern in lowered:
+            reasons.append(f"phrase:{pattern}")
+
+    latest = (user_text or "").lower()
+    if any(term in latest for term in ["summarize", "summarise", "summary", "compact", "压缩", "总结"]):
+        reasons.append("latest_user_summary_intent")
+    if request_chars >= 20000:
+        reasons.append("large_request_chars")
+    if message_count >= 20:
+        reasons.append("large_message_count")
+
+    strong = any(
+        reason.startswith("phrase:conversation summary")
+        or reason.startswith("phrase:summary of the conversation")
+        or reason.startswith("phrase:previous conversation")
+        or reason.startswith("phrase:context window")
+        or reason.startswith("phrase:上下文压缩")
+        for reason in reasons
+    )
+    size_assisted = ("latest_user_summary_intent" in reasons) and (
+        "large_request_chars" in reasons or "large_message_count" in reasons
+    )
+
+    return {
+        "candidate": bool(strong or size_assisted),
+        "reasons": sorted(set(reasons)),
+        "request_chars": request_chars,
+        "message_count": message_count,
+    }
+
+
 def start_trace(
     *,
     protocol: str,
@@ -303,6 +385,7 @@ def start_trace(
     scope: dict[str, str],
     user_text: str,
     memories: list[dict[str, Any]],
+    compact: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "trace_id": uuid.uuid4().hex[:16],
@@ -315,6 +398,10 @@ def start_trace(
         "user_id": scope["user_id"],
         "session_id": scope["session_id"],
         "query_preview": preview_text(user_text),
+        "request_chars": int(compact.get("request_chars") or 0),
+        "message_count": int(compact.get("message_count") or 0),
+        "compact_candidate": bool(compact.get("candidate")),
+        "compact_reason": compact.get("reasons") or [],
         "recalled_block_ids": [memory["block_id"] for memory in memories],
         "recalled_scores": [round(float(memory.get("score") or 0.0), 3) for memory in memories],
         "injected": bool(memories),
@@ -339,9 +426,10 @@ def finish_trace(
                 INSERT OR REPLACE INTO proxy_trace
                 (trace_id, started_at, finished_at, duration_ms, protocol, path,
                  stream, project_id, user_id, session_id, query_preview,
+                 request_chars, message_count, compact_candidate, compact_reason,
                  recalled_block_ids, recalled_scores, injected, checkpoint_block_id,
                  checkpoint_status, upstream_status, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trace["trace_id"],
@@ -355,6 +443,10 @@ def finish_trace(
                     trace["user_id"],
                     trace["session_id"],
                     trace["query_preview"],
+                    trace["request_chars"],
+                    trace["message_count"],
+                    1 if trace["compact_candidate"] else 0,
+                    json.dumps(trace["compact_reason"], ensure_ascii=False),
                     json.dumps(trace["recalled_block_ids"], ensure_ascii=False),
                     json.dumps(trace["recalled_scores"], ensure_ascii=False),
                     1 if trace["injected"] else 0,
@@ -739,6 +831,10 @@ def trace_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "user_id": row["user_id"] or "",
         "session_id": row["session_id"] or "",
         "query_preview": row["query_preview"] or "",
+        "request_chars": row["request_chars"] or 0,
+        "message_count": row["message_count"] or 0,
+        "compact_candidate": bool(row["compact_candidate"]),
+        "compact_reason": parse_keywords(row["compact_reason"]),
         "recalled_block_ids": parse_keywords(row["recalled_block_ids"]),
         "recalled_scores": parse_keywords(row["recalled_scores"]),
         "injected": bool(row["injected"]),
@@ -758,6 +854,28 @@ async def vctx_traces(limit: int = 20, project: str = "") -> dict[str, Any]:
         filters.append("COALESCE(project_id, '') = ?")
         params.append(project)
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with db_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM proxy_trace
+            {where}
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+    return {"count": len(rows), "traces": [trace_row_to_dict(row) for row in rows]}
+
+
+@app.get("/vctx/compact-probes")
+async def vctx_compact_probes(limit: int = 20, project: str = "") -> dict[str, Any]:
+    limit = max(1, min(int(limit), 200))
+    filters = ["compact_candidate = 1"]
+    params: list[Any] = []
+    if project:
+        filters.append("COALESCE(project_id, '') = ?")
+        params.append(project)
+    where = "WHERE " + " AND ".join(filters)
     with db_conn() as conn:
         rows = conn.execute(
             f"""
@@ -794,6 +912,7 @@ async def openai_chat_completions(request: Request) -> Response:
     user_text = extract_openai_user_text(payload)
     memories = recall_memory(user_text, project_id=scope["project_id"], user_id=scope["user_id"])
     injected = inject_openai_memory(payload, format_memory(memories))
+    compact = compact_probe(payload, user_text)
     trace = start_trace(
         protocol="openai",
         path="/v1/chat/completions",
@@ -801,6 +920,7 @@ async def openai_chat_completions(request: Request) -> Response:
         scope=scope,
         user_text=user_text,
         memories=memories,
+        compact=compact,
     )
 
     if payload.get("stream"):
@@ -869,6 +989,7 @@ async def anthropic_messages(request: Request) -> Response:
     user_text = extract_anthropic_user_text(payload)
     memories = recall_memory(user_text, project_id=scope["project_id"], user_id=scope["user_id"])
     injected = inject_anthropic_memory(payload, format_memory(memories))
+    compact = compact_probe(payload, user_text)
     trace = start_trace(
         protocol="anthropic",
         path="/v1/messages",
@@ -876,6 +997,7 @@ async def anthropic_messages(request: Request) -> Response:
         scope=scope,
         user_text=user_text,
         memories=memories,
+        compact=compact,
     )
 
     if payload.get("stream"):

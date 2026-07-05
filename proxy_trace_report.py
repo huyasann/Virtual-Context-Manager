@@ -24,6 +24,10 @@ TRACE_COLUMNS = [
     "user_id",
     "session_id",
     "query_preview",
+    "request_chars",
+    "message_count",
+    "compact_candidate",
+    "compact_reason",
     "recalled_block_ids",
     "recalled_scores",
     "injected",
@@ -33,8 +37,8 @@ TRACE_COLUMNS = [
     "error",
 ]
 
-JSON_COLUMNS = {"recalled_block_ids", "recalled_scores"}
-BOOL_COLUMNS = {"stream", "injected"}
+JSON_COLUMNS = {"compact_reason", "recalled_block_ids", "recalled_scores"}
+BOOL_COLUMNS = {"stream", "compact_candidate", "injected"}
 
 
 def json_dumps(data: Any) -> str:
@@ -46,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite DB path")
     parser.add_argument("--limit", type=int, default=20, help="Maximum traces to return")
     parser.add_argument("--project", help="Filter by project_id")
+    parser.add_argument("--compact-only", action="store_true", help="Only show compact candidates")
     return parser.parse_args()
 
 
@@ -73,7 +78,12 @@ def decode_value(column: str, value: Any) -> Any:
     return value
 
 
-def fetch_traces(conn: sqlite3.Connection, limit: int, project: str | None) -> list[dict[str, Any]]:
+def fetch_traces(
+    conn: sqlite3.Connection,
+    limit: int,
+    project: str | None,
+    compact_only: bool,
+) -> list[dict[str, Any]]:
     columns = table_columns(conn, "proxy_trace")
     if not columns:
         return []
@@ -91,6 +101,11 @@ def fetch_traces(conn: sqlite3.Connection, limit: int, project: str | None) -> l
             return []
         sql += ' WHERE "project_id" = ?'
         params.append(project)
+    if compact_only:
+        if "compact_candidate" not in columns:
+            return []
+        sql += " AND " if " WHERE " in sql else " WHERE "
+        sql += '"compact_candidate" = 1'
 
     if "started_at" in columns:
         sql += ' ORDER BY "started_at" DESC'
@@ -120,7 +135,7 @@ def main() -> int:
             if not table_columns(conn, "proxy_trace"):
                 print(json_dumps({"traces": [], "message": "proxy_trace table not found"}))
                 return 0
-            print(json_dumps({"traces": fetch_traces(conn, args.limit, args.project)}))
+            print(json_dumps({"traces": fetch_traces(conn, args.limit, args.project, args.compact_only)}))
             return 0
     except sqlite3.Error as exc:
         print(json_dumps({"traces": [], "error": str(exc)}), file=sys.stderr)

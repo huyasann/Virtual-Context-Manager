@@ -88,6 +88,7 @@ Debug endpoints:
 GET  /healthz
 GET  /vctx/status
 GET  /vctx/traces
+GET  /vctx/compact-probes
 POST /vctx/recall
 ```
 
@@ -130,12 +131,22 @@ Trace report:
 
 ```bash
 python proxy_trace_report.py --project mimo-deep-test --limit 20
+python proxy_trace_report.py --project mimo-deep-test --compact-only
 ```
 
 Proxy traces are stored in the same SQLite database as `blocks`, in the
 `proxy_trace` table. They record protocol, path, project/session scope, recall
 block IDs/scores, injection status, upstream status, checkpoint status, and
 checkpoint block ID.
+
+Compact probe:
+
+`proxy.py` does not yet claim to handle real Claude/Codex compact events
+automatically. It records compact candidates in `proxy_trace` using conservative
+heuristics such as "conversation summary", "previous conversation", "context
+window", "compact", "上下文压缩", and large request + summary intent. Use
+`/vctx/compact-probes` or `proxy_trace_report.py --compact-only` after a real
+client compact run to inspect the request shape.
 
 ### CC Switch Integration Prototype
 
