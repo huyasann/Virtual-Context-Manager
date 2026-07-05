@@ -31,12 +31,19 @@ UPSTREAM_BASE_URL = os.getenv("VCTX_UPSTREAM_BASE_URL", "").rstrip("/")
 UPSTREAM_API_KEY = os.getenv("VCTX_UPSTREAM_API_KEY", "")
 RECALL_TOP_K = int(os.getenv("VCTX_RECALL_TOP_K", "3"))
 MAX_MEMORY_CHARS = int(os.getenv("VCTX_MAX_MEMORY_CHARS", "12000"))
+RECALL_MIN_SCORE = float(os.getenv("VCTX_RECALL_MIN_SCORE", "2.0"))
 CHECKPOINT_MIN_CHARS = int(os.getenv("VCTX_CHECKPOINT_MIN_CHARS", "2500"))
 CHECKPOINT_EVERY_N_TURNS = int(os.getenv("VCTX_CHECKPOINT_EVERY_N_TURNS", "8"))
+CHECKPOINT_STREAMING = os.getenv("VCTX_CHECKPOINT_STREAMING", "1") not in {"0", "false", "False"}
+PROJECT_HEADER = os.getenv("VCTX_PROJECT_HEADER", "x-vctx-project")
+USER_HEADER = os.getenv("VCTX_USER_HEADER", "x-vctx-user")
+SESSION_HEADER = os.getenv("VCTX_SESSION_HEADER", "x-vctx-session")
+DEFAULT_PROJECT_ID = os.getenv("VCTX_PROJECT_ID", "")
+DEFAULT_USER_ID = os.getenv("VCTX_USER_ID", "")
 
 app = FastAPI(title="vctx-proxy", version="0.1.0")
-_turn_counter = 0
-_turn_buffer: list[dict[str, str]] = []
+_turn_counters: dict[str, int] = {}
+_turn_buffers: dict[str, list[dict[str, str]]] = {}
 
 
 @contextmanager
@@ -56,6 +63,8 @@ def db_conn():
                 keywords      TEXT,
                 conclusion    TEXT,
                 session_id    TEXT,
+                project_id    TEXT,
+                user_id       TEXT,
                 source        TEXT DEFAULT 'proxy',
                 fingerprint   TEXT,
                 created_at    TEXT,
@@ -78,6 +87,8 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(blocks)").fetchall()}
     columns = {
         "session_id": "TEXT",
+        "project_id": "TEXT",
+        "user_id": "TEXT",
         "source": "TEXT DEFAULT 'proxy'",
         "fingerprint": "TEXT",
         "importance": "REAL DEFAULT 1.0",
@@ -116,29 +127,61 @@ def parse_keywords(raw: Any) -> list[str]:
         return []
 
 
-def recall_memory(query: str, top_k: int = RECALL_TOP_K, max_chars: int = MAX_MEMORY_CHARS) -> list[dict[str, Any]]:
+def recall_memory(
+    query: str,
+    top_k: int = RECALL_TOP_K,
+    max_chars: int = MAX_MEMORY_CHARS,
+    project_id: str = "",
+    user_id: str = "",
+    min_score: float = RECALL_MIN_SCORE,
+) -> list[dict[str, Any]]:
     terms = tokenize_query(query)
     if not terms:
         return []
 
     with db_conn() as conn:
+        filters: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            filters.append("COALESCE(project_id, '') = ?")
+            params.append(project_id)
+        if user_id:
+            filters.append("COALESCE(user_id, '') = ?")
+            params.append(user_id)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
         rows = conn.execute(
-            """
+            f"""
             SELECT block_id, title, content, conclusion, keywords, token_count,
-                   importance, access_count
+                   importance, access_count, project_id, user_id
             FROM blocks
+            {where}
             ORDER BY importance DESC, access_count DESC, created_at DESC
-            """
+            """,
+            params,
         ).fetchall()
 
         hits: list[dict[str, Any]] = []
         for row in rows:
             keywords = parse_keywords(row["keywords"])
-            searchable = f"{row['title']} {row['conclusion']} {' '.join(keywords)}".lower()
-            matched = [term for term in terms if term in searchable]
-            if not matched:
+            title = str(row["title"] or "").lower()
+            conclusion = str(row["conclusion"] or "").lower()
+            keyword_text = " ".join(str(item) for item in keywords).lower()
+            content = str(row["content"] or "").lower()
+            title_hits = [term for term in terms if term in title]
+            conclusion_hits = [term for term in terms if term in conclusion]
+            keyword_hits = [term for term in terms if term in keyword_text]
+            content_hits = [term for term in terms if term in content]
+            matched = sorted(set(title_hits + conclusion_hits + keyword_hits + content_hits))
+            score = (
+                len(title_hits) * 4
+                + len(keyword_hits) * 3
+                + len(conclusion_hits) * 2
+                + len(content_hits) * 1
+                + float(row["importance"] or 1.0) * 0.2
+                + min(int(row["access_count"] or 0), 20) * 0.05
+            )
+            if not matched or score < min_score:
                 continue
-            score = len(matched) * 2 + float(row["importance"] or 1.0)
             hits.append(
                 {
                     "block_id": row["block_id"],
@@ -148,6 +191,9 @@ def recall_memory(query: str, top_k: int = RECALL_TOP_K, max_chars: int = MAX_ME
                     "keywords": keywords,
                     "score": score,
                     "token_count": row["token_count"],
+                    "matched_terms": matched,
+                    "project_id": row["project_id"] or "",
+                    "user_id": row["user_id"] or "",
                 }
             )
 
@@ -186,15 +232,25 @@ def format_memory(memories: list[dict[str, Any]]) -> str:
         parts.append(
             "\n".join(
                 [
-                    f"[{idx}] {memory['title']} ({memory['block_id']})",
+                    f"[{idx}] {memory['title']} ({memory['block_id']}, score={memory.get('score', 0):.2f})",
                     f"Conclusion: {memory.get('conclusion') or ''}",
                     f"Keywords: {', '.join(memory.get('keywords') or [])}",
+                    f"Matched: {', '.join(memory.get('matched_terms') or [])}",
                     "Content:",
                     memory.get("content") or "",
                 ]
             )
         )
     return "\n\n".join(parts)
+
+
+def request_scope(request: Request) -> dict[str, str]:
+    project_id = request.headers.get(PROJECT_HEADER, DEFAULT_PROJECT_ID).strip()
+    user_id = request.headers.get(USER_HEADER, DEFAULT_USER_ID).strip()
+    session_id = request.headers.get(SESSION_HEADER, "").strip()
+    if not session_id:
+        session_id = project_id or user_id or "vctx-proxy"
+    return {"project_id": project_id, "user_id": user_id, "session_id": session_id}
 
 
 def extract_openai_user_text(payload: dict[str, Any]) -> str:
@@ -273,31 +329,43 @@ def extract_anthropic_assistant_text(response: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def maybe_checkpoint(user_text: str, assistant_text: str, session_id: str = "proxy") -> None:
-    global _turn_counter
+def maybe_checkpoint(
+    user_text: str,
+    assistant_text: str,
+    session_id: str = "proxy",
+    project_id: str = "",
+    user_id: str = "",
+    protocol: str = "proxy",
+) -> str | None:
     if not user_text and not assistant_text:
-        return
-    _turn_counter += 1
-    _turn_buffer.append({"user": user_text, "assistant": assistant_text})
+        return None
+
+    key = f"{protocol}:{project_id}:{user_id}:{session_id}"
+    _turn_counters[key] = _turn_counters.get(key, 0) + 1
+    turn_buffer = _turn_buffers.setdefault(key, [])
+    turn_buffer.append({"user": user_text, "assistant": assistant_text})
 
     combined = "\n\n".join(
         f"[user]\n{turn['user']}\n\n[assistant]\n{turn['assistant']}"
-        for turn in _turn_buffer
+        for turn in turn_buffer
     )
-    if len(combined) < CHECKPOINT_MIN_CHARS and _turn_counter % CHECKPOINT_EVERY_N_TURNS != 0:
-        return
+    if len(combined) < CHECKPOINT_MIN_CHARS and _turn_counters[key] % CHECKPOINT_EVERY_N_TURNS != 0:
+        return None
     if len(combined) < CHECKPOINT_MIN_CHARS:
-        return
+        return None
 
-    archive_block(
+    block_id = archive_block(
         title=derive_title(user_text),
         content=combined,
         conclusion=derive_conclusion(assistant_text),
         keywords=derive_keywords(combined),
         session_id=session_id,
-        source="proxy-checkpoint",
+        project_id=project_id,
+        user_id=user_id,
+        source="vctx-proxy",
     )
-    _turn_buffer.clear()
+    turn_buffer.clear()
+    return block_id
 
 
 def derive_title(text: str) -> str:
@@ -329,14 +397,23 @@ def archive_block(
     conclusion: str,
     keywords: list[str],
     session_id: str,
-    source: str,
+    project_id: str = "",
+    user_id: str = "",
+    source: str = "vctx-proxy",
 ) -> str:
     fingerprint = hashlib.sha256(content.encode("utf-8")).hexdigest()
     block_id = f"{datetime.now().strftime('%y%m%d')}-{fingerprint[:6]}"
     now = datetime.now().isoformat()
     with db_conn() as conn:
         existing = conn.execute(
-            "SELECT block_id FROM blocks WHERE fingerprint=? LIMIT 1", (fingerprint,)
+            """
+            SELECT block_id FROM blocks
+            WHERE fingerprint=?
+              AND COALESCE(project_id, '')=?
+              AND COALESCE(user_id, '')=?
+            LIMIT 1
+            """,
+            (fingerprint, project_id, user_id),
         ).fetchone()
         if existing:
             return existing["block_id"]
@@ -344,8 +421,8 @@ def archive_block(
             """
             INSERT INTO blocks
             (block_id, title, content, token_count, keywords, conclusion,
-             session_id, source, fingerprint, created_at, last_access, importance)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0)
+             session_id, project_id, user_id, source, fingerprint, created_at, last_access, importance)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0)
             """,
             (
                 block_id,
@@ -355,6 +432,8 @@ def archive_block(
                 json.dumps(keywords, ensure_ascii=False),
                 conclusion,
                 session_id,
+                project_id,
+                user_id,
                 source,
                 fingerprint,
                 now,
@@ -366,9 +445,10 @@ def archive_block(
 
 def upstream_headers(request: Request) -> dict[str, str]:
     headers: dict[str, str] = {}
+    internal_headers = {PROJECT_HEADER.lower(), USER_HEADER.lower(), SESSION_HEADER.lower()}
     for key, value in request.headers.items():
         lower = key.lower()
-        if lower in {"host", "content-length", "connection"}:
+        if lower in {"host", "content-length", "connection"} or lower in internal_headers:
             continue
         headers[key] = value
     if UPSTREAM_API_KEY:
@@ -389,16 +469,72 @@ async def forward_json(path: str, payload: dict[str, Any], request: Request) -> 
     return JSONResponse(status_code=response.status_code, content=response.json())
 
 
-async def forward_stream(path: str, payload: dict[str, Any], request: Request) -> StreamingResponse:
+def extract_sse_text(raw: bytes, protocol: str) -> str:
+    text = raw.decode("utf-8", errors="ignore")
+    parts: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if protocol == "openai":
+            for choice in event.get("choices", []) or []:
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+        else:
+            event_type = event.get("type")
+            if event_type == "content_block_delta":
+                delta = event.get("delta") or {}
+                if isinstance(delta.get("text"), str):
+                    parts.append(delta["text"])
+            elif event_type == "content_block_start":
+                block = event.get("content_block") or {}
+                if isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+            elif "content" in event:
+                parts.append(content_to_text(event.get("content")))
+    return "".join(parts)
+
+
+async def forward_stream(
+    path: str,
+    payload: dict[str, Any],
+    request: Request,
+    *,
+    user_text: str,
+    scope: dict[str, str],
+    protocol: str,
+) -> StreamingResponse:
     client = httpx.AsyncClient(timeout=None)
     upstream = client.stream("POST", upstream_url(path), headers=upstream_headers(request), json=payload)
     response = await upstream.__aenter__()
+    collected = bytearray()
 
     async def iterator():
         try:
             async for chunk in response.aiter_bytes():
+                if CHECKPOINT_STREAMING:
+                    collected.extend(chunk)
                 yield chunk
         finally:
+            if CHECKPOINT_STREAMING and 200 <= response.status_code < 300:
+                assistant_text = extract_sse_text(bytes(collected), protocol)
+                maybe_checkpoint(
+                    user_text,
+                    assistant_text,
+                    session_id=scope["session_id"],
+                    project_id=scope["project_id"],
+                    user_id=scope["user_id"],
+                    protocol=f"{protocol}-stream",
+                )
             await upstream.__aexit__(None, None, None)
             await client.aclose()
 
@@ -417,18 +553,71 @@ async def healthz() -> dict[str, Any]:
         "db": str(DB_PATH),
         "recall_top_k": RECALL_TOP_K,
         "max_memory_chars": MAX_MEMORY_CHARS,
+        "recall_min_score": RECALL_MIN_SCORE,
+        "checkpoint_min_chars": CHECKPOINT_MIN_CHARS,
+        "checkpoint_streaming": CHECKPOINT_STREAMING,
+        "project_header": PROJECT_HEADER,
+        "user_header": USER_HEADER,
+        "session_header": SESSION_HEADER,
     }
+
+
+@app.get("/vctx/status")
+async def vctx_status() -> dict[str, Any]:
+    with db_conn() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
+        proxy_blocks = conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE source='vctx-proxy'"
+        ).fetchone()[0]
+        projects = [
+            row[0] or ""
+            for row in conn.execute(
+                "SELECT DISTINCT COALESCE(project_id, '') FROM blocks ORDER BY 1 LIMIT 50"
+            ).fetchall()
+        ]
+    return {
+        "ok": True,
+        "db": str(DB_PATH),
+        "blocks": total,
+        "proxy_checkpoints": proxy_blocks,
+        "projects": projects,
+        "turn_buffers": {key: len(value) for key, value in _turn_buffers.items()},
+    }
+
+
+@app.post("/vctx/recall")
+async def vctx_recall(request: Request) -> dict[str, Any]:
+    payload = await request.json()
+    scope = request_scope(request)
+    query = str(payload.get("query") or "")
+    top_k = int(payload.get("top_k") or RECALL_TOP_K)
+    memories = recall_memory(
+        query,
+        top_k=top_k,
+        project_id=scope["project_id"],
+        user_id=scope["user_id"],
+        min_score=float(payload.get("min_score") or RECALL_MIN_SCORE),
+    )
+    return {"query": query, "scope": scope, "count": len(memories), "memories": memories}
 
 
 @app.post("/v1/chat/completions")
 async def openai_chat_completions(request: Request) -> Response:
     payload = await request.json()
+    scope = request_scope(request)
     user_text = extract_openai_user_text(payload)
-    memories = recall_memory(user_text)
+    memories = recall_memory(user_text, project_id=scope["project_id"], user_id=scope["user_id"])
     injected = inject_openai_memory(payload, format_memory(memories))
 
     if payload.get("stream"):
-        return await forward_stream("/v1/chat/completions", injected, request)
+        return await forward_stream(
+            "/v1/chat/completions",
+            injected,
+            request,
+            user_text=user_text,
+            scope=scope,
+            protocol="openai",
+        )
 
     async with httpx.AsyncClient(timeout=None) as client:
         upstream_response = await client.post(
@@ -447,19 +636,34 @@ async def openai_chat_completions(request: Request) -> Response:
         )
 
     if upstream_response.is_success:
-        maybe_checkpoint(user_text, extract_openai_assistant_text(data), session_id="openai-proxy")
+        maybe_checkpoint(
+            user_text,
+            extract_openai_assistant_text(data),
+            session_id=scope["session_id"],
+            project_id=scope["project_id"],
+            user_id=scope["user_id"],
+            protocol="openai",
+        )
     return JSONResponse(status_code=upstream_response.status_code, content=data)
 
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request) -> Response:
     payload = await request.json()
+    scope = request_scope(request)
     user_text = extract_anthropic_user_text(payload)
-    memories = recall_memory(user_text)
+    memories = recall_memory(user_text, project_id=scope["project_id"], user_id=scope["user_id"])
     injected = inject_anthropic_memory(payload, format_memory(memories))
 
     if payload.get("stream"):
-        return await forward_stream("/v1/messages", injected, request)
+        return await forward_stream(
+            "/v1/messages",
+            injected,
+            request,
+            user_text=user_text,
+            scope=scope,
+            protocol="anthropic",
+        )
 
     async with httpx.AsyncClient(timeout=None) as client:
         upstream_response = await client.post(
@@ -478,7 +682,14 @@ async def anthropic_messages(request: Request) -> Response:
         )
 
     if upstream_response.is_success:
-        maybe_checkpoint(user_text, extract_anthropic_assistant_text(data), session_id="anthropic-proxy")
+        maybe_checkpoint(
+            user_text,
+            extract_anthropic_assistant_text(data),
+            session_id=scope["session_id"],
+            project_id=scope["project_id"],
+            user_id=scope["user_id"],
+            protocol="anthropic",
+        )
     return JSONResponse(status_code=upstream_response.status_code, content=data)
 
 

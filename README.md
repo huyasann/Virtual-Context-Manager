@@ -28,7 +28,9 @@ python smoke_test.py
 ### VCTX Proxy MVP
 
 This repository also includes `proxy.py`, an experimental memory middleware for
-OpenAI-compatible and Anthropic-compatible clients.
+OpenAI-compatible and Anthropic-compatible clients. Treat it as the fast
+iteration lab for VCTX memory policy before porting stable behavior into CC
+Switch or another router.
 
 Supported endpoints:
 
@@ -39,10 +41,13 @@ Supported endpoints:
 The proxy:
 
 1. extracts the latest user message
-2. recalls relevant blocks from `~/.vctx/memory.db`
-3. injects a bounded `<VCTX_MEMORY>` section into the request
+2. recalls relevant blocks from `~/.vctx/memory.db`, optionally scoped by
+   project/user headers
+3. injects a bounded `<VCTX_MEMORY>` section into the request when recall score
+   passes `VCTX_RECALL_MIN_SCORE`
 4. forwards the request to `VCTX_UPSTREAM_BASE_URL`
-5. archives substantial non-streaming turns as proxy checkpoints
+5. archives substantial non-streaming turns and supported SSE streaming turns as
+   proxy checkpoints
 
 Run:
 
@@ -64,11 +69,49 @@ For Anthropic-compatible clients, point `/v1/messages` traffic to:
 http://127.0.0.1:8787/v1/messages
 ```
 
+Useful environment variables:
+
+```text
+VCTX_RECALL_TOP_K=3
+VCTX_MAX_MEMORY_CHARS=12000
+VCTX_RECALL_MIN_SCORE=2.0
+VCTX_CHECKPOINT_MIN_CHARS=2500
+VCTX_CHECKPOINT_STREAMING=1
+VCTX_PROJECT_HEADER=x-vctx-project
+VCTX_USER_HEADER=x-vctx-user
+VCTX_SESSION_HEADER=x-vctx-session
+```
+
+Debug endpoints:
+
+```text
+GET  /healthz
+GET  /vctx/status
+POST /vctx/recall
+```
+
+Project isolation:
+
+```bash
+curl -H "x-vctx-project: my-project" \
+     -H "x-vctx-session: dev-session" \
+     http://127.0.0.1:8787/vctx/status
+```
+
 Proxy smoke test:
 
 ```bash
 python proxy_smoke_test.py
 ```
+
+Live proxy verification against a running upstream:
+
+```bash
+python proxy_live_test.py --proxy-url http://127.0.0.1:8787 --model claude-sonnet-4-5
+```
+
+The live test seeds a diagnostic VCTX block, verifies readback through the model,
+and checks that a long response creates a `source='vctx-proxy'` checkpoint.
 
 ### CC Switch Integration Prototype
 
