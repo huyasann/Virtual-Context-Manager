@@ -80,6 +80,10 @@ VCTX_CHECKPOINT_STREAMING=1
 VCTX_PROJECT_HEADER=x-vctx-project
 VCTX_USER_HEADER=x-vctx-user
 VCTX_SESSION_HEADER=x-vctx-session
+VCTX_PROMPT_COMPLETION=0
+VCTX_PROMPT_COMPLETION_MAX_CHARS=1200
+VCTX_PROMPT_COMPLETION_MAX_TOKENS=1200
+VCTX_PROMPT_COMPLETION_TIMEOUT=60
 ```
 
 Debug endpoints:
@@ -138,6 +142,23 @@ Proxy traces are stored in the same SQLite database as `blocks`, in the
 `proxy_trace` table. They record protocol, path, project/session scope, recall
 block IDs/scores, injection status, upstream status, checkpoint status, and
 checkpoint block ID.
+
+Same-model prompt completion:
+
+Set `VCTX_PROMPT_COMPLETION=1` to ask the same upstream model for a concise
+supplemental instruction block before the final request is sent. The user's
+original request is not rewritten; the proxy injects an additional
+`<VCTX_PROMPT_COMPLETION>` system block when the completion result is low/medium
+risk. Internal completion calls use `x-vctx-internal: prompt-completion` and
+bypass recall, checkpointing, and normal request tracing.
+
+Live prompt-completion verification:
+
+```bash
+set VCTX_PROMPT_COMPLETION=1
+python proxy.py --host 127.0.0.1 --port 8787
+python proxy_prompt_completion_live_test.py --proxy-url http://127.0.0.1:8787 --model claude-sonnet-4-5
+```
 
 Compact probe:
 

@@ -28,6 +28,10 @@ TRACE_COLUMNS = [
     "message_count",
     "compact_candidate",
     "compact_reason",
+    "prompt_completion_used",
+    "prompt_completion_chars",
+    "prompt_completion_risk",
+    "prompt_completion_reason",
     "recalled_block_ids",
     "recalled_scores",
     "injected",
@@ -38,7 +42,7 @@ TRACE_COLUMNS = [
 ]
 
 JSON_COLUMNS = {"compact_reason", "recalled_block_ids", "recalled_scores"}
-BOOL_COLUMNS = {"stream", "compact_candidate", "injected"}
+BOOL_COLUMNS = {"stream", "compact_candidate", "prompt_completion_used", "injected"}
 
 
 def json_dumps(data: Any) -> str:

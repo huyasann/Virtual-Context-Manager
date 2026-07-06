@@ -42,6 +42,16 @@ USER_HEADER = os.getenv("VCTX_USER_HEADER", "x-vctx-user")
 SESSION_HEADER = os.getenv("VCTX_SESSION_HEADER", "x-vctx-session")
 DEFAULT_PROJECT_ID = os.getenv("VCTX_PROJECT_ID", "")
 DEFAULT_USER_ID = os.getenv("VCTX_USER_ID", "")
+INTERNAL_HEADER = os.getenv("VCTX_INTERNAL_HEADER", "x-vctx-internal")
+PROMPT_COMPLETION_ENABLED = os.getenv("VCTX_PROMPT_COMPLETION", "0") in {"1", "true", "True"}
+PROMPT_COMPLETION_MAX_CHARS = int(os.getenv("VCTX_PROMPT_COMPLETION_MAX_CHARS", "1200"))
+PROMPT_COMPLETION_MAX_TOKENS = int(os.getenv("VCTX_PROMPT_COMPLETION_MAX_TOKENS", "1200"))
+PROMPT_COMPLETION_TIMEOUT = float(os.getenv("VCTX_PROMPT_COMPLETION_TIMEOUT", "60"))
+PROMPT_COMPLETION_RISK_ALLOW = {
+    item.strip().lower()
+    for item in os.getenv("VCTX_PROMPT_COMPLETION_RISK_ALLOW", "low,medium").split(",")
+    if item.strip()
+}
 
 app = FastAPI(title="vctx-proxy", version="0.1.0")
 _turn_counters: dict[str, int] = {}
@@ -91,6 +101,10 @@ def db_conn():
                 message_count      INTEGER,
                 compact_candidate  INTEGER DEFAULT 0,
                 compact_reason     TEXT,
+                prompt_completion_used INTEGER DEFAULT 0,
+                prompt_completion_chars INTEGER,
+                prompt_completion_risk TEXT,
+                prompt_completion_reason TEXT,
                 recalled_block_ids TEXT,
                 recalled_scores    TEXT,
                 injected           INTEGER DEFAULT 0,
@@ -138,6 +152,10 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         "message_count": "INTEGER",
         "compact_candidate": "INTEGER DEFAULT 0",
         "compact_reason": "TEXT",
+        "prompt_completion_used": "INTEGER DEFAULT 0",
+        "prompt_completion_chars": "INTEGER",
+        "prompt_completion_risk": "TEXT",
+        "prompt_completion_reason": "TEXT",
     }
     for name, ddl in trace_columns.items():
         if name not in existing_trace:
@@ -402,6 +420,10 @@ def start_trace(
         "message_count": int(compact.get("message_count") or 0),
         "compact_candidate": bool(compact.get("candidate")),
         "compact_reason": compact.get("reasons") or [],
+        "prompt_completion_used": False,
+        "prompt_completion_chars": 0,
+        "prompt_completion_risk": "",
+        "prompt_completion_reason": "",
         "recalled_block_ids": [memory["block_id"] for memory in memories],
         "recalled_scores": [round(float(memory.get("score") or 0.0), 3) for memory in memories],
         "injected": bool(memories),
@@ -427,9 +449,10 @@ def finish_trace(
                 (trace_id, started_at, finished_at, duration_ms, protocol, path,
                  stream, project_id, user_id, session_id, query_preview,
                  request_chars, message_count, compact_candidate, compact_reason,
-                 recalled_block_ids, recalled_scores, injected, checkpoint_block_id,
+                 prompt_completion_used, prompt_completion_chars, prompt_completion_risk,
+                 prompt_completion_reason, recalled_block_ids, recalled_scores, injected, checkpoint_block_id,
                  checkpoint_status, upstream_status, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trace["trace_id"],
@@ -447,6 +470,10 @@ def finish_trace(
                     trace["message_count"],
                     1 if trace["compact_candidate"] else 0,
                     json.dumps(trace["compact_reason"], ensure_ascii=False),
+                    1 if trace.get("prompt_completion_used") else 0,
+                    int(trace.get("prompt_completion_chars") or 0),
+                    trace.get("prompt_completion_risk") or "",
+                    trace.get("prompt_completion_reason") or "",
                     json.dumps(trace["recalled_block_ids"], ensure_ascii=False),
                     json.dumps(trace["recalled_scores"], ensure_ascii=False),
                     1 if trace["injected"] else 0,
@@ -518,6 +545,171 @@ def inject_anthropic_memory(payload: dict[str, Any], memory_text: str) -> dict[s
     else:
         cloned["system"] = memory
     return cloned
+
+
+def inject_openai_system_block(payload: dict[str, Any], tag: str, text: str) -> dict[str, Any]:
+    if not text:
+        return payload
+    cloned = dict(payload)
+    messages = list(cloned.get("messages", []))
+    block = {"role": "system", "content": f"<{tag}>\n{text}\n</{tag}>"}
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+        insert_at += 1
+    messages.insert(insert_at, block)
+    cloned["messages"] = messages
+    return cloned
+
+
+def inject_anthropic_system_block(payload: dict[str, Any], tag: str, text: str) -> dict[str, Any]:
+    if not text:
+        return payload
+    cloned = dict(payload)
+    existing = cloned.get("system", "")
+    block = f"<{tag}>\n{text}\n</{tag}>"
+    if isinstance(existing, str) and existing:
+        cloned["system"] = f"{existing}\n\n{block}"
+    elif isinstance(existing, list):
+        cloned["system"] = existing + [{"type": "text", "text": block}]
+    else:
+        cloned["system"] = block
+    return cloned
+
+
+def inject_openai_prompt_completion(payload: dict[str, Any], completion: str) -> dict[str, Any]:
+    return inject_openai_system_block(payload, "VCTX_PROMPT_COMPLETION", completion)
+
+
+def inject_anthropic_prompt_completion(payload: dict[str, Any], completion: str) -> dict[str, Any]:
+    return inject_anthropic_system_block(payload, "VCTX_PROMPT_COMPLETION", completion)
+
+
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def normalize_prompt_completion(data: dict[str, Any] | None) -> dict[str, Any]:
+    if not data:
+        return {"should_inject": False, "completion": "", "risk": "high", "reason": "invalid_json"}
+    completion = preview_text(str(data.get("completion") or ""), PROMPT_COMPLETION_MAX_CHARS)
+    risk = str(data.get("risk") or "medium").lower()
+    should_inject = bool(data.get("should_inject")) and bool(completion)
+    if risk not in PROMPT_COMPLETION_RISK_ALLOW:
+        should_inject = False
+    return {
+        "should_inject": should_inject,
+        "completion": completion,
+        "risk": risk,
+        "reason": preview_text(str(data.get("reason") or ""), 240),
+    }
+
+
+def prompt_completion_instruction(
+    *,
+    user_text: str,
+    protocol: str,
+    project_id: str,
+    memories: list[dict[str, Any]],
+    compact: dict[str, Any],
+) -> str:
+    recalled_titles = [str(memory.get("title") or "")[:80] for memory in memories[:3]]
+    compact_note = "compact_candidate" if compact.get("candidate") else "normal_request"
+    return (
+        "Return only one JSON object, no markdown.\n"
+        "You create a supplemental instruction for a later final model call.\n"
+        "Do not answer the user. Do not rewrite the user request. Do not add unsupported facts.\n"
+        "If the user asks a vague coding continuation, inject workflow guidance: inspect state, continue implementation, run tests, report concisely.\n"
+        "If the user explicitly says to only output a literal answer, do not inject.\n"
+        'Schema: {"should_inject": boolean, "completion": string, "risk": "low|medium|high", "reason": string}\n'
+        f"Protocol: {protocol}\n"
+        f"Project: {project_id}\n"
+        f"Request kind: {compact_note}\n"
+        f"Recalled titles: {json.dumps(recalled_titles, ensure_ascii=False)}\n"
+        f"User request: {user_text[:1200]}\n"
+    )
+
+
+async def complete_prompt_with_same_model(
+    *,
+    protocol: str,
+    path: str,
+    original_payload: dict[str, Any],
+    user_text: str,
+    scope: dict[str, str],
+    memories: list[dict[str, Any]],
+    compact: dict[str, Any],
+    request: Request,
+) -> dict[str, Any]:
+    if not PROMPT_COMPLETION_ENABLED or request.headers.get(INTERNAL_HEADER):
+        return {"should_inject": False, "completion": "", "risk": "disabled", "reason": "disabled_or_internal"}
+
+    instruction = prompt_completion_instruction(
+        user_text=user_text,
+        protocol=protocol,
+        project_id=scope["project_id"],
+        memories=memories,
+        compact=compact,
+    )
+    model = original_payload.get("model")
+    if protocol == "anthropic":
+        payload = {
+            "model": model,
+            "max_tokens": PROMPT_COMPLETION_MAX_TOKENS,
+            "stream": False,
+            "system": "Return only valid JSON. Do not explain.",
+            "messages": [
+                {"role": "user", "content": instruction},
+                {"role": "assistant", "content": "{"},
+            ],
+        }
+    else:
+        payload = {
+            "model": model,
+            "max_tokens": PROMPT_COMPLETION_MAX_TOKENS,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": "Return only valid JSON. Do not explain."},
+                {"role": "user", "content": instruction},
+            ],
+        }
+
+    headers = upstream_headers(request)
+    headers[INTERNAL_HEADER] = "prompt-completion"
+    try:
+        async with httpx.AsyncClient(timeout=PROMPT_COMPLETION_TIMEOUT) as client:
+            response = await client.post(upstream_url(path), headers=headers, json=payload)
+        if not response.is_success:
+            return {
+                "should_inject": False,
+                "completion": "",
+                "risk": "high",
+                "reason": f"upstream_status_{response.status_code}",
+            }
+        data = response.json()
+        text = extract_anthropic_assistant_text(data) if protocol == "anthropic" else extract_openai_assistant_text(data)
+        normalized = normalize_prompt_completion(extract_json_object(text))
+        normalized["raw_status"] = response.status_code
+        return normalized
+    except Exception as exc:
+        detail = preview_text(str(exc), 160)
+        reason = f"error:{type(exc).__name__}" + (f":{detail}" if detail else "")
+        return {"should_inject": False, "completion": "", "risk": "high", "reason": reason}
 
 
 def extract_openai_assistant_text(response: dict[str, Any]) -> str:
@@ -652,7 +844,12 @@ def archive_block(
 
 def upstream_headers(request: Request) -> dict[str, str]:
     headers: dict[str, str] = {}
-    internal_headers = {PROJECT_HEADER.lower(), USER_HEADER.lower(), SESSION_HEADER.lower()}
+    internal_headers = {
+        PROJECT_HEADER.lower(),
+        USER_HEADER.lower(),
+        SESSION_HEADER.lower(),
+        INTERNAL_HEADER.lower(),
+    }
     for key, value in request.headers.items():
         lower = key.lower()
         if lower in {"host", "content-length", "connection"} or lower in internal_headers:
@@ -674,6 +871,35 @@ async def forward_json(path: str, payload: dict[str, Any], request: Request) -> 
     async with httpx.AsyncClient(timeout=None) as client:
         response = await client.post(upstream_url(path), headers=upstream_headers(request), json=payload)
     return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+async def direct_passthrough(path: str, payload: dict[str, Any], request: Request) -> Response:
+    if payload.get("stream"):
+        client = httpx.AsyncClient(timeout=None)
+        upstream = client.stream("POST", upstream_url(path), headers=upstream_headers(request), json=payload)
+        response = await upstream.__aenter__()
+
+        async def iterator():
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            finally:
+                await upstream.__aexit__(None, None, None)
+                await client.aclose()
+
+        return StreamingResponse(
+            iterator(),
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type", "text/event-stream"),
+        )
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        response = await client.post(upstream_url(path), headers=upstream_headers(request), json=payload)
+    return Response(
+        status_code=response.status_code,
+        content=response.content,
+        media_type=response.headers.get("content-type"),
+    )
 
 
 def extract_sse_text(raw: bytes, protocol: str) -> str:
@@ -787,6 +1013,11 @@ async def healthz() -> dict[str, Any]:
         "recall_min_score": RECALL_MIN_SCORE,
         "checkpoint_min_chars": CHECKPOINT_MIN_CHARS,
         "checkpoint_streaming": CHECKPOINT_STREAMING,
+        "prompt_completion_enabled": PROMPT_COMPLETION_ENABLED,
+        "prompt_completion_max_chars": PROMPT_COMPLETION_MAX_CHARS,
+        "prompt_completion_max_tokens": PROMPT_COMPLETION_MAX_TOKENS,
+        "prompt_completion_timeout": PROMPT_COMPLETION_TIMEOUT,
+        "internal_header": INTERNAL_HEADER,
         "project_header": PROJECT_HEADER,
         "user_header": USER_HEADER,
         "session_header": SESSION_HEADER,
@@ -835,6 +1066,10 @@ def trace_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "message_count": row["message_count"] or 0,
         "compact_candidate": bool(row["compact_candidate"]),
         "compact_reason": parse_keywords(row["compact_reason"]),
+        "prompt_completion_used": bool(row["prompt_completion_used"]),
+        "prompt_completion_chars": row["prompt_completion_chars"] or 0,
+        "prompt_completion_risk": row["prompt_completion_risk"] or "",
+        "prompt_completion_reason": row["prompt_completion_reason"] or "",
         "recalled_block_ids": parse_keywords(row["recalled_block_ids"]),
         "recalled_scores": parse_keywords(row["recalled_scores"]),
         "injected": bool(row["injected"]),
@@ -908,10 +1143,11 @@ async def vctx_recall(request: Request) -> dict[str, Any]:
 @app.post("/v1/chat/completions")
 async def openai_chat_completions(request: Request) -> Response:
     payload = await request.json()
+    if request.headers.get(INTERNAL_HEADER):
+        return await direct_passthrough("/v1/chat/completions", payload, request)
     scope = request_scope(request)
     user_text = extract_openai_user_text(payload)
     memories = recall_memory(user_text, project_id=scope["project_id"], user_id=scope["user_id"])
-    injected = inject_openai_memory(payload, format_memory(memories))
     compact = compact_probe(payload, user_text)
     trace = start_trace(
         protocol="openai",
@@ -922,6 +1158,24 @@ async def openai_chat_completions(request: Request) -> Response:
         memories=memories,
         compact=compact,
     )
+    prompt_completion = await complete_prompt_with_same_model(
+        protocol="openai",
+        path="/v1/chat/completions",
+        original_payload=payload,
+        user_text=user_text,
+        scope=scope,
+        memories=memories,
+        compact=compact,
+        request=request,
+    )
+    trace["prompt_completion_used"] = bool(prompt_completion.get("should_inject"))
+    trace["prompt_completion_chars"] = len(prompt_completion.get("completion") or "")
+    trace["prompt_completion_risk"] = prompt_completion.get("risk") or ""
+    trace["prompt_completion_reason"] = prompt_completion.get("reason") or ""
+    injected = payload
+    if prompt_completion.get("should_inject"):
+        injected = inject_openai_prompt_completion(injected, prompt_completion["completion"])
+    injected = inject_openai_memory(injected, format_memory(memories))
 
     if payload.get("stream"):
         return await forward_stream(
@@ -985,10 +1239,11 @@ async def openai_chat_completions(request: Request) -> Response:
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request) -> Response:
     payload = await request.json()
+    if request.headers.get(INTERNAL_HEADER):
+        return await direct_passthrough("/v1/messages", payload, request)
     scope = request_scope(request)
     user_text = extract_anthropic_user_text(payload)
     memories = recall_memory(user_text, project_id=scope["project_id"], user_id=scope["user_id"])
-    injected = inject_anthropic_memory(payload, format_memory(memories))
     compact = compact_probe(payload, user_text)
     trace = start_trace(
         protocol="anthropic",
@@ -999,6 +1254,24 @@ async def anthropic_messages(request: Request) -> Response:
         memories=memories,
         compact=compact,
     )
+    prompt_completion = await complete_prompt_with_same_model(
+        protocol="anthropic",
+        path="/v1/messages",
+        original_payload=payload,
+        user_text=user_text,
+        scope=scope,
+        memories=memories,
+        compact=compact,
+        request=request,
+    )
+    trace["prompt_completion_used"] = bool(prompt_completion.get("should_inject"))
+    trace["prompt_completion_chars"] = len(prompt_completion.get("completion") or "")
+    trace["prompt_completion_risk"] = prompt_completion.get("risk") or ""
+    trace["prompt_completion_reason"] = prompt_completion.get("reason") or ""
+    injected = payload
+    if prompt_completion.get("should_inject"):
+        injected = inject_anthropic_prompt_completion(injected, prompt_completion["completion"])
+    injected = inject_anthropic_memory(injected, format_memory(memories))
 
     if payload.get("stream"):
         return await forward_stream(
